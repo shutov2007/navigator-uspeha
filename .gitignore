@@ -1,6 +1,5 @@
 # Byte-compiled / optimized / DLL files
 VK_TOKEN.env
-config.py
 navigator_data.json
 __pycache__/
 *.pyc
