@@ -10,12 +10,10 @@
 """
 
 #!/usr/bin/env python3
-import json
 import os
 import random
-import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
@@ -24,11 +22,13 @@ from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = os.getenv("VK_TOKEN")
 if not TOKEN:
-    raise RuntimeError("VK_TOKEN не найден! Добавь переменную окружения в панели Bothost.")
+    print("❌ ОШИБКА: Переменная окружения VK_TOKEN не найдена!")
+    print("👉 Добавь её в панели Bothost: имя — VK_TOKEN, значение — токен сообщества.")
+    exit(1)
 
-DATA_FILE = "navigator_data.json"
+print("✅ Токен загружен, бот запускается...")
 
-# --- ДАННЫЕ ---
+# --- ДАННЫЕ (в памяти, без файла) ---
 SUBJECT_CATEGORIES = {
     "Основные": [
         "Математика", "Алгебра", "Геометрия",
@@ -62,28 +62,11 @@ STUDY_TIPS = [
     "💡 Совет: делай домашку в тишине, без телефона рядом. 25 минут работы, 5 отдыха — техника Pomodoro.",
 ]
 
-# --- ХРАНИЛИЩЕ ---
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {
-        "schedules": {},
-        "events": {},
-        "grades": {},
-        "homework": {},
-        "tracker": {},
-        "goals": {},
-        "last_quote_date": {},
-    }
+# Хранилище состояний (чтобы не спамить)
+last_message_time = {}
+MIN_INTERVAL_SECONDS = 2
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-DATA = load_data()
-
-# --- КЛАВИАТУРЫ (БЕЗОПАСНЫЕ) ---
+# --- КЛАВИАТУРЫ ---
 def build_keyboard(rows, one_time=False):
     kb = VkKeyboard(one_time=one_time)
     for row_idx, row in enumerate(rows):
@@ -131,21 +114,35 @@ def subjects_keyboard(category):
     ])
     return build_keyboard(rows)
 
-# --- ЛОГИКА БОТА ---
+# --- ОТПРАВКА СООБЩЕНИЙ ---
 def send_message(user_id, text, keyboard=None):
-    vk.messages.send(
-        user_id=user_id,
-        message=text,
-        keyboard=keyboard,
-        random_id=random.randint(0, 2**31 - 1)
-    )
+    # Защита от спама
+    now = time.time()
+    if user_id in last_message_time:
+        elapsed = now - last_message_time[user_id]
+        if elapsed < MIN_INTERVAL_SECONDS:
+            # Просто игнорируем повторную отправку за короткий срок
+            return
+    last_message_time[user_id] = now
 
+    try:
+        vk.messages.send(
+            user_id=user_id,
+            message=text,
+            keyboard=keyboard,
+            random_id=random.randint(0, 2**31 - 1)
+        )
+        print(f"[OK] Сообщение отправлено пользователю {user_id}")
+    except Exception as e:
+        print(f"[ERROR] Не удалось отправить сообщение: {e}")
+
+# --- ОБРАБОТКА СООБЩЕНИЙ ---
 def handle_message(event):
     text = event.text.lower()
     user_id = event.user_id
 
     # Главное меню
-    if text in ["начать", "меню", "🏠 главное меню"]:
+    if text in ["начать", "меню", "🏠 главное меню", "/start"]:
         send_message(user_id, "Привет! Я «Навигатор Успеха». Чем помочь?", main_keyboard())
         return
 
@@ -156,17 +153,17 @@ def handle_message(event):
 
     # Обработка категорий (по названию)
     for cat in SUBJECT_CATEGORIES:
-        if text.startswith(f"📁 {cat}"):
+        if text.startswith(f"📁 {cat}".lower()):
             send_message(user_id, f"Предметы категории «{cat}»:", subjects_keyboard(cat))
             return
 
     # Возврат к категориям
-    if text == "⬅️ к категориям":
+    if text in ["⬅️ к категориям", "к категориям"]:
         send_message(user_id, "Выбери категорию:", categories_keyboard())
         return
 
     # Назад
-    if text == "⬅️ назад":
+    if text in ["⬅️ назад", "назад"]:
         send_message(user_id, "Главное меню:", main_keyboard())
         return
 
@@ -196,10 +193,13 @@ vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 
 print("==================================================")
-print("  Навигатор Успеха v1.0")
+print("  Навигатор Успеха v2.0 (исправленный)")
 print("  Бот запущен! ✅")
 print("==================================================")
 
-for event in longpoll.listen():
-    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-        handle_message(event)
+try:
+    for event in longpoll.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            handle_message(event)
+except Exception as e:
+    print(f"[CRITICAL] Ошибка в цикле longpoll: {e}")
