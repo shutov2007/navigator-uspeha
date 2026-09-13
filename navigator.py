@@ -396,6 +396,88 @@ def subjects_keyboard(category):
     ])
     return build_keyboard(rows)
 
+def cok_resources(subject):
+    """Возвращает полезные образовательные ресурсы по предмету."""
+    links = {
+        "Математика": [
+            "📌 Фоксфорд.Учебник — теория и задачи по классам:\nhttps://foxford.ru/wiki/maths",
+            "📌 Билимленд — интерактивные уроки:\nhttps://bilimland.kz/ru/subject/math",
+        ],
+        "Алгебра": [
+            "📌 Фоксфорд.Учебник — алгебра:\nhttps://foxford.ru/wiki/maths",
+            "📌 Маткультура — видеоуроки:\nhttps://mathculturo.ru",
+        ],
+        "Геометрия": [
+            "📌 Геометрия — анимированные доказательства:\nhttps://foxford.ru/wiki/maths/geometry",
+            "📌 Math100.ru — задачи с решениями:\nhttps://math100.ru",
+        ],
+        "Русский язык": [
+            "📌 Грамота.ру — справочник по русскому языку:\nhttps://gramota.ru",
+            "📌 Фоксфорд.Учебник — русский язык:\nhttps://foxford.ru/wiki/russian",
+        ],
+        "Литература": [
+            "📌 Литрес — школьная библиотека:\nhttps://www.litres.ru/shkolnaya-biblioteka/",
+            "📌 Фоксфорд.Учебник — литература:\nhttps://foxford.ru/wiki/literature",
+        ],
+        "Английский язык": [
+            "📌 Duolingo — бесплатная практика:\nhttps://www.duolingo.com",
+            "📌 Lingualeo — курсы и словарь:\nhttps://lingualeo.com",
+        ],
+        "Физика": [
+            "📌 Фоксфорд.Учебник — физика:\nhttps://foxford.ru/wiki/physics",
+            "📌 Курсы Курчатовского института:\nhttps://foxford.ru/courses/physics",
+        ],
+        "Химия": [
+            "📌 Фоксфорд.Учебник — химия:\nhttps://foxford.ru/wiki/chemistry",
+            "📌 ХиМуза — викторины и опыты:\nhttps://himucha.ru",
+        ],
+        "Биология": [
+            "📌 Биология для школьников — Лекториум:\nhttps://lektorium.tv",
+            "📌 Фоксфорд.Учебник — биология:\nhttps://foxford.ru/wiki/biology",
+        ],
+        "География": [
+            "📌 Фоксфорд.Учебник — география:\nhttps://foxford.ru/wiki/geography",
+            "📌 Яндекс.Учебник — материалы по географии:\nhttps://education.yandex.ru",
+        ],
+        "История": [
+            "📌 Arzamas — лекции по истории:\nhttps://arzamas.academy",
+            "📌 Фоксфорд.Учебник — история:\nhttps://foxford.ru/wiki/history",
+        ],
+        "Обществознание": [
+            "📌 Фоксфорд.Учебник — обществознание:\nhttps://foxford.ru/wiki/social-science",
+        ],
+        "Информатика": [
+            "📌 Codecademy — основы программирования:\nhttps://www.codecademy.com",
+            "📌 Stepik — бесплатные курсы:\nhttps://stepik.org",
+        ],
+        "Окружающий мир": [
+            "📌 Яндекс.Учебник — окружающий мир:\nhttps://education.yandex.ru",
+        ],
+        "Литературное чтение": [
+            "📌 Литрес — школьная библиотека:\nhttps://www.litres.ru/shkolnaya-biblioteka/",
+        ],
+        "Музыка": [
+            "📌 Музыкальная классика — материалы для урока:\nhttps://music.uvic.me",
+        ],
+        "ИЗО": [
+            "📌 Drawspace — бесплатные уроки рисования:\nhttps://drawspace.com",
+        ],
+        "Технология": [
+            "📌 Stepik — курсы по технологии:\nhttps://stepik.org",
+        ],
+        "Физкультура": [
+            "📌 Комплексы упражнений для дома:\nhttps://ya.ru/video/search?text=утренняя+зарядка+для+школьников",
+        ],
+        "ОБЖ": [
+            "📌 Фоксфорд.Учебник — ОБЖ:\nhttps://foxford.ru/wiki/obzh",
+        ],
+    }
+    items = links.get(subject, [
+        "📌 Полезные ресурсы скоро появятся!",
+    ])
+    return f"📚 Полезные ресурсы по предмету «{subject}»:\n\n" + "\n\n".join(items) + \
+           "\n\n⚠️ Некоторые ссылки могут открываться только из браузера."
+
 def homework_keyboard():
     return build_keyboard([
         [("➕ Добавить ДЗ", VkKeyboardColor.PRIMARY),
@@ -516,10 +598,50 @@ def reminder_loop():
         time.sleep(60)
 
 # ─── ОБРАБОТКА ───
-def handle_message(event):
-    text = event.text
-    uid = event.user_id
-    uid_s = str(uid)
+    if text == "⬅️ К категориям":
+        send_message(uid, "Выбери категорию:", categories_keyboard())
+        return
+
+    # ── НОВОЕ: клик по предмету из ЦОК ──
+    all_cok_subjects = set()
+    for subs in SUBJECT_CATEGORIES.values():
+        all_cok_subjects.update(subs)
+
+    if text in all_cok_subjects:
+        # Сохраняем выбранный предмет и предлагаем варианты
+        user_state[uid] = {"step": "cok_subject", "subject": text}
+        send_message(uid,
+            f"📖 Предмет: {text}\n\nЧто делаем?",
+            build_keyboard([
+                [("🤖 Объяснить тему", VkKeyboardColor.POSITIVE)],
+                [("📚 Полезные ресурсы", VkKeyboardColor.PRIMARY)],
+                [("⬅️ К категориям", VkKeyboardColor.SECONDARY),
+                 ("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+            ]))
+        return
+
+    if text == "🤖 Объяснить тему" and uid in user_state and user_state[uid].get("step") == "cok_subject":
+        subj = user_state[uid]["subject"]
+        del user_state[uid]
+        grade = DATA.get("schedules", {}).get(uid_s, {}).get("grade", "")
+        track_topic(uid_s, subj)
+        send_message(uid, f"🤖 ИИ-тьютор объясняет: {subj}... ⏳", ai_keyboard())
+        explanation = ai_explain(f"Расскажи кратко, что изучает предмет «{subj}» и какие главные темы в нём", grade)
+        add_points(uid_s, 20, "вопрос ИИ")
+        pts_info = points_info(uid_s)
+        full_msg = f"🤖 ИИ-тьютор:\n\n{explanation}\n\n---\n{pts_info} (+20 баллов! 🎉)"
+        send_message(uid, full_msg, ai_keyboard())
+        return
+
+    if text == "📚 Полезные ресурсы" and uid in user_state and user_state[uid].get("step") == "cok_subject":
+        subj = user_state[uid]["subject"]
+        del user_state[uid]
+        resources = cok_resources(subj)
+        send_message(uid, resources, build_keyboard([
+            [("⬅️ К категориям", VkKeyboardColor.SECONDARY),
+             ("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+        ]))
+        return
 
     # Перезагружаем данные (на случай изменений из фонового потока)
     global DATA
