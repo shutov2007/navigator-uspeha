@@ -10,77 +10,88 @@
 """
 
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Навигатор Успеха v3.0
+Чат-бот для школьников (5-9 класс)
+Конкурс «Технологии Первых» 2026
 
-import os
-import sys
+Новое в v3.0:
+- ИИ-тьютор (GigaChat) — объясняет темы простыми словами
+- Умный анализ нагрузки на неделю
+- Трекинг прогресса и «карта пробелов»
+- Геймификация: баллы и уровни
+"""
+
 import json
+import os
 import random
-import time
-import re
 import threading
+import time
 from datetime import datetime, timedelta
 
-# --- ПРОВЕРКА ТОКЕНА ---
+import vk_api
+from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+
+# ─── КОНФИГУРАЦИЯ ───
 TOKEN = os.getenv("VK_TOKEN")
 if not TOKEN:
-    print("=" * 60)
-    print("ОШИБКА: Переменная окружения VK_TOKEN не найдена!")
-    print("Добавьте её в панели Bothost:")
-    print("  Имя: VK_TOKEN")
-    print("  Значение: токен вашего сообщества ВКонтакте")
-    print("=" * 60)
-    sys.exit(1)
+    raise RuntimeError("VK_TOKEN не найден! Добавь переменную окружения VK_TOKEN в панели Bothost.")
 
-try:
-    import vk_api
-    from vk_api.longpoll import VkLongPoll, VkEventType
-    from vk_api.keyboard import VkKeyboard, VkKeyboardColor
-except ImportError:
-    print("ОШИБКА: библиотека vk_api не установлена!")
-    print("Убедитесь, что в requirements.txt указано: vk_api==11.9.9")
-    sys.exit(1)
+GIGA_KEY = os.getenv("GIGA_KEY", "")  # Ключ GigaChat (пустой = ИИ выключен)
 
+DATA_FILE = "navigator_data.json"
 
-# ============================================================
-#  КОНСТАНТЫ И ДАННЫЕ
-# ============================================================
-
-VERSION = "3.0"
-BOT_NAME = "Навигатор Успеха"
-
-DAYS_OF_WEEK = [
-    "Понедельник", "Вторник", "Среда",
-    "Четверг", "Пятница", "Суббота", "Воскресенье",
-]
-
-DAYS_SHORT = {
-    "понедельник": "Понедельник", "пн": "Понедельник",
-    "вторник": "Вторник", "вт": "Вторник",
-    "среда": "Среда", "ср": "Среда",
-    "четверг": "Четверг", "чт": "Четверг",
-    "пятница": "Пятница", "пт": "Пятница",
-    "суббота": "Суббота", "сб": "Суббота",
-    "воскресенье": "Воскресенье", "вс": "Воскресенье",
+# ─── ПРЕДМЕТЫ ПО КЛАССАМ ───
+GRADE_SUBJECTS = {
+    "5 класс": ["Математика", "Русский язык", "Литература", "Английский язык",
+                "История", "Биология", "География", "Обществознание",
+                "Информатика", "Музыка", "ИЗО", "Технология", "Физкультура", "ОБЖ"],
+    "6 класс": ["Математика", "Русский язык", "Литература", "Английский язык",
+                "История", "Биология", "География", "Обществознание",
+                "Информатика", "Музыка", "ИЗО", "Технология", "Физкультура", "ОБЖ"],
+    "7 класс": ["Алгебра", "Геометрия", "Русский язык", "Литература",
+                "Английский язык", "История", "Обществознание", "Биология",
+                "География", "Физика", "Информатика", "Музыка", "ИЗО",
+                "Технология", "Физкультура", "ОБЖ"],
+    "8 класс": ["Алгебра", "Геометрия", "Русский язык", "Литература",
+                "Английский язык", "История", "Обществознание", "Биология",
+                "География", "Физика", "Химия", "Информатика",
+                "ИЗО", "Технология", "Физкультура", "ОБЖ"],
+    "9 класс": ["Алгебра", "Геометрия", "Русский язык", "Литература",
+                "Английский язык", "История", "Обществознание", "Биология",
+                "География", "Физика", "Химия", "Информатика", "Физкультура", "ОБЖ"],
 }
 
+EXTRA_ACTIVITIES = [
+    "🎵 Музыкальная школа", "⚽ Спортивная секция", "📚 Репетитор",
+    "🎭 Репетиция", "💃 Танцы", "🎨 Изостудия", "♟️ Шахматы", "➕ Другое",
+]
+
+DAYS_RU = {
+    "monday": "Понедельник", "tuesday": "Вторник", "wednesday": "Среда",
+    "thursday": "Четверг", "friday": "Пятница", "saturday": "Суббота",
+    "sunday": "Воскресенье",
+}
+DAYS_ORDER = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+DAY_NAME_TO_KEY = {v.lower(): k for k, v in DAYS_RU.items()}
+
+TIMES = ["08:30", "09:20", "10:10", "11:00", "12:00", "12:50",
+         "13:40", "14:30", "15:20", "16:00", "17:00", "18:00", "19:00"]
+
 SUBJECT_CATEGORIES = {
-    "Основные": [
-        "Математика", "Алгебра", "Геометрия",
-        "Русский язык", "Литература", "Английский язык",
-    ],
-    "Естественные": [
-        "Физика", "Химия", "Биология",
-        "География", "Информатика",
-    ],
-    "Гуманитарные": [
-        "История", "Обществознание",
-        "Окружающий мир", "Литературное чтение",
-    ],
-    "Творчество и спорт": [
-        "ИЗО", "Музыка", "Технология",
-        "Физкультура", "ОБЖ",
-    ],
+    "Основные": ["Математика", "Алгебра", "Геометрия", "Русский язык", "Литература", "Английский язык"],
+    "Естественные": ["Физика", "Химия", "Биология", "География", "Информатика"],
+    "Гуманитарные": ["История", "Обществознание", "Окружающий мир", "Литературное чтение"],
+    "Творчество и спорт": ["ИЗО", "Музыка", "Технология", "Физкультура", "ОБЖ"],
+}
+
+# «Тяжесть» предметов для анализа нагрузки (1-3)
+SUBJECT_DIFFICULTY = {
+    "Математика": 3, "Алгебра": 3, "Геометрия": 3, "Физика": 3, "Химия": 3,
+    "Русский язык": 2, "Литература": 2, "Английский язык": 2, "История": 2,
+    "Обществознание": 2, "Биология": 2, "География": 1, "Информатика": 2,
+    "Музыка": 1, "ИЗО": 1, "Технология": 1, "Физкультура": 1, "ОБЖ": 1,
 }
 
 MORNING_QUOTES = [
@@ -89,137 +100,185 @@ MORNING_QUOTES = [
     "Маленькие шаги ведут к большим целям. Дерзай! 🎯",
     "Ты умнее, чем думаешь. Верь в себя! 💪",
     "Знания — это суперсила. Используй её сегодня! ⚡",
-    "Не бойся ошибаться — бойся ничего не делать! 🚀",
-    "Каждый эксперт когда-то был новичком. Продолжай! 🌟",
-    "Учись так, чтобы завтра ты был лучше, чем вчера! 📈",
-    "Терпение и труд всё перетрут. Не сдавайся! 🔥",
-    "Твой прогресс зависит от твоих усилий. Действуй! ⚡",
 ]
 
 STUDY_TIPS = [
     "💡 Совет: читай учебник с карандашом — отмечай главное прямо в тексте.",
     "💡 Совет: объясни новую тему кому-то — так ты поймёшь её лучше.",
-    "💡 Совет: делай домашку в тишине, без телефона рядом. 25 минут работы, 5 отдыха — техника Pomodoro.",
-    "💡 Совет: повторяй материал перед сном — мозг лучше запомнит во сне.",
-    "💡 Совет: рисуй схемы и таблицы — визуализация помогает запоминать.",
-    "💡 Совет: не откладывай на завтра. Сделай маленькую часть прямо сейчас.",
-    "💡 Совет: делай перерывы каждые 30-40 минут. Мозгу нужно отдыхать.",
-    "💡 Совет: пей воду во время занятий — это помогает концентрации.",
-    "💡 Совет: составляй план на день с вечера — так легче начать утро.",
-    "💡 Совет: используй карточки для запоминания терминов и дат.",
+    "💡 Совет: 25 минут работы, 5 отдыха — техника Pomodoro. Попробуй!",
+    "💡 Совет: повторяй материал перед сном — мозг запоминает лучше.",
 ]
 
-MOTIVATION_STORIES = [
-    ("Томас Эдисон", "Эдисон провёл более 1000 экспериментов, прежде чем создал рабочую лампу. "
-     "Когда его спросили о неудачах, он ответил: «Я не проиграл — я нашёл 1000 способов, которые не работают»."),
-    ("Уолт Дисней", "Диснея уволили из газеты за «недостаток воображения». Позже он создал самую "
-     "известную анимационную студию в мире."),
-    ("Альберт Эйнштейн", "Учителя считали Эйнштейна медлительным и неспособным. "
-     "А он стал одним из величайших физиков в истории."),
-    ("Джоан Роулинг", "Рукопись «Гарри Поттера» отклонили 12 издательств. "
-     "А потом книга стала бестселлером во всём мире."),
-    ("Михаил Ломоносов", "Сын рыбака из Архангельской губернии пешкой дошёл до Москвы, "
-     "чтобы учиться. Стал великим русским учёным."),
+# Уровни геймификации
+LEVELS = [
+    (0,    "🌱 Новичок"),
+    (50,   "📚 Ученик"),
+    (150,  "🎓 Знаток"),
+    (300,  "🏆 Навигатор знаний"),
+    (500,  "⭐ Магистр знаний"),
 ]
 
-EDUCATIONAL_LINKS = {
-    "Математика": [
-        ("Учи.ру — интерактивные задания", "https://uchi.ru"),
-        ("Яндекс.Учебник — математика", "https://education.yandex.ru"),
-        ("Skysmart — онлайн-уроки", "https://skysmart.ru"),
-    ],
-    "Русский язык": [
-        ("Учи.ру — русский язык", "https://uchi.ru"),
-        ("Грамота.ру — справочная служба", "https://gramota.ru"),
-        ("Яндекс.Учебник — русский", "https://education.yandex.ru"),
-    ],
-    "Английский язык": [
-        ("Duolingo — изучение языков", "https://duolingo.com"),
-        ("Lingualeo — английский онлайн", "https://lingualeo.com"),
-    ],
-    "Физика": [
-        ("Skysmart — физика", "https://skysmart.ru"),
-        ("Элементы — наука", "https://elementy.ru"),
-    ],
-    "Информатика": [
-        ("Code.org — основы программирования", "https://code.org"),
-        ("Stepik — курсы", "https://stepik.org"),
-    ],
-    "История": [
-        ("Арзамас — истории", "https://arzamas.academy"),
-        ("История.РФ — портал", "https://histrf.ru"),
-    ],
-    "Биология": [
-        ("Биомолекула — наука о жизни", "https://biomolecula.ru"),
-        ("Учи.ру — окружающий мир", "https://uchi.ru"),
-    ],
-    "Химия": [
-        ("Skysmart — химия", "https://skysmart.ru"),
-        ("Химик — таблица Менделеева", "https://chemister.ru"),
-    ],
-    "География": [
-        ("Яндекс.Карты", "https://yandex.ru/maps"),
-        ("Учи.ру — география", "https://uchi.ru"),
-    ],
-    "Литература": [
-        ("Флибуста — книги", "https://flibusta.is"),
-        ("Литрес — аудиокниги", "https://litres.ru"),
-    ],
-    "Обществознание": [
-        ("Stepik — обществознание", "https://stepik.org"),
-        ("Skysmart — обществознание", "https://skysmart.ru"),
-    ],
-    "Алгебра": [
-        ("Skysmart — алгебра", "https://skysmart.ru"),
-        ("Учи.ру — математика", "https://uchi.ru"),
-    ],
-    "Геометрия": [
-        ("Skysmart — геометрия", "https://skysmart.ru"),
-        ("Учи.ру — математика", "https://uchi.ru"),
-    ],
-}
+def get_level(points):
+    name = LEVELS[0][1]
+    threshold = LEVELS[0][0]
+    for lvl_points, lvl_name in LEVELS:
+        if points >= lvl_points:
+            name = lvl_name
+            threshold = lvl_points
+    next_level = None
+    for lvl_points, lvl_name in LEVELS:
+        if points < lvl_points:
+            next_level = (lvl_points, lvl_name)
+            break
+    return name, threshold, next_level
 
-DEFAULT_LINKS = [
-    ("Учи.ру — интерактивная школа", "https://uchi.ru"),
-    ("Яндекс.Учебник", "https://education.yandex.ru"),
-    ("Skysmart — онлайн-школа", "https://skysmart.ru"),
-    ("Stepik — онлайн-курсы", "https://stepik.org"),
-]
+# ─── ИИ-TЬЮТОР (GigaChat) ───
+def ai_explain(topic, grade=""):
+    """Объясняет тему через GigaChat простыми словами для школьника."""
+    if not GIGA_KEY:
+        return ("🤖 ИИ-тьютор пока не подключён. "
+                "Чтобы его включить, нужно получить бесплатный ключ GigaChat "
+                "на developers.sber.ru и добавить его в переменную GIGA_KEY.")
+    try:
+        from gigachat import GigaChat
 
+        grade_hint = f"Ученик учится в {grade}." if grade else "Ученик 5-9 класса."
 
-# ============================================================
-#  ХРАНИЛИЩЕ ДАННЫХ (в памяти)
-# ============================================================
+        system_prompt = (
+            f"Ты — дружелюбный школьный тьютор. {grade_hint} "
+            "Объясни тему ПРОСТЫМИ словами, с примерами из жизни. "
+            "НЕ давай готовые ответы на домашние задания — подводи к пониманию. "
+            "В конце задай ОДИН проверочный вопрос по теме. "
+            "Ответ должен быть коротким — не больше 150 слов."
+        )
 
-user_data = {}
-user_states = {}
-last_message_time = {}
-original_texts = {}
-MIN_INTERVAL = 1
+        with GigaChat(credentials=GIGA_KEY, verify_ssl_certs=False) as giga:
+            response = giga.chat({
+                "model": "GigaChat",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Объясни тему: {topic}"},
+                ],
+            })
+            return response.choices[0].message.content
+    except ImportError:
+        return "🤖 Библиотека gigachat не установлена. Напиши: pip install gigachat"
+    except Exception as e:
+        return f"🤖 ИИ-тьютор временно недоступен. Попробуй позже! ({str(e)[:50]})"
 
+# ─── ХРАНИЛИЩЕ ───
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "schedules": {},
+        "reminders_on": {},
+        "homework": {},
+        "grades": {},
+        "points": {},       # user_id -> int (баллы геймификации)
+        "ai_history": {},   # user_id -> [{"topic": ..., "date": ...}]
+    }
 
-def get_user_data(user_id):
-    """Получить данные пользователя или создать пустые."""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "schedules": {},
-            "homework": [],
-            "reminders": [],
-            "grades": {},
-            "goals": [],
-            "last_quote_date": None,
-            "name": None,
-        }
-    return user_data[user_id]
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(DATA, f, ensure_ascii=False, indent=2)
 
+DATA = load_data()
+sent_reminders = {}
 
-# ============================================================
-#  КЛАВИАТУРЫ
-# ============================================================
+# ─── ГЕЙМИФИКАЦИЯ ───
+def add_points(uid_s, amount, reason=""):
+    points = DATA.setdefault("points", {}).get(uid_s, 0) + amount
+    DATA["points"][uid_s] = points
+    save_data()
+    return points
 
+def points_info(uid_s):
+    points = DATA.get("points", {}).get(uid_s, 0)
+    name, threshold, next_level = get_level(points)
+    info = f"🎯 Твой уровень: {name}\n🏅 Баллов: {points}"
+    if next_level:
+        need = next_level[0] - points
+        info += f"\n До «{next_level[1]}»: {need} баллов"
+    return info
+
+# ─── АНАЛИЗ НАГРУЗКИ ───
+def analyze_week(uid_s):
+    """Анализирует неделю и даёт рекомендации."""
+    week = DATA.get("schedules", {}).get(uid_s, {}).get("week", {})
+    if not week:
+        return "Расписание не настроено. Сначала добавь уроки!"
+
+    day_scores = {}
+    for day_key in DAYS_ORDER:
+        items = week.get(day_key, [])
+        score = sum(SUBJECT_DIFFICULTY.get(item.get("subject", ""), 2)
+                     for item in items if item.get("type") == "lesson")
+        extras = sum(1 for item in items if item.get("type") == "extra")
+        day_scores[day_key] = {"lessons": len(items), "difficulty": score, "extras": extras}
+
+    hardest = max(day_scores.items(), key=lambda x: x[1]["difficulty"])
+    easiest = min(day_scores.items(), key=lambda x: x[1]["difficulty"])
+
+    lines = ["📊 Анализ недели:\n"]
+
+    for day_key in DAYS_ORDER:
+        if day_key not in day_scores:
+            continue
+        info = day_scores[day_key]
+        bar = "█" * min(info["difficulty"], 10)
+        lines.append(f"  {DAYS_RU[day_key]}: {bar} ({info['lessons']} уроков"
+                     + (f", +{info['extras']} кружков" if info["extras"] else "")
+                     + ")")
+
+    lines.append("")
+    if hardest[1]["difficulty"] >= 8:
+        lines.append(f"⚠️ Самый тяжёлый день — {DAYS_RU[hardest[0]]}.")
+        lines.append(f"💡 Совет: готовься к нему заранее.")
+        if easiest[1]["difficulty"] <= 3 and easiest[0] != hardest[0]:
+            day_before = DAYS_ORDER[DAYS_ORDER.index(easiest[0])]
+            lines.append(f"  В {DAYS_RU[day_before]} меньше нагрузки — займись подготовкой.")
+    else:
+        lines.append("✅ Нагрузка распределена равномерно. Так держать!")
+
+    return "\n".join(lines)
+
+# ─── ТРЕКИНГ ПРОГРЕССА ───
+def track_topic(uid_s, topic):
+    DATA.setdefault("ai_history", {}).setdefault(uid_s, []).append({
+        "topic": topic, "date": datetime.now().strftime("%d.%m"),
+    })
+    save_data()
+
+def progress_report(uid_s):
+    history = DATA.get("ai_history", {}).get(uid_s, [])
+    if not history:
+        return "Ты ещё не спрашивал у ИИ-тьютора. Напиши «Объясни тему: ...», и я начну отслеживать!"
+
+    # Подсчёт тем
+    topic_count = {}
+    for entry in history:
+        t = entry["topic"].lower()
+        topic_count[t] = topic_count.get(t, 0) + 1
+
+    lines = ["📈 Карта твоих запросов:\n"]
+    for topic, count in sorted(topic_count.items(), key=lambda x: -x[1]):
+        bars = "▓" * min(count, 10)
+        lines.append(f"  {topic}: {bars} ({count} раз)")
+
+    # Рекомендация
+    top_topic = max(topic_count.items(), key=lambda x: x[1])
+    if top_topic[1] >= 3:
+        lines.append(f"\n💡 Ты спрашивал про «{top_topic[0]}» уже {top_topic[1]} раз.")
+        lines.append("Давай закрепим! Напиши эту тему ещё раз — я дам проверочный вопрос.")
+    else:
+        lines.append("\n✅ Пока всё под контролем!")
+
+    return "\n".join(lines)
+
+# ─── КЛАВИАТУРЫ ───
 def build_keyboard(rows, one_time=False):
-    """Безопасно строит клавиатуру из списка строк.
-    Каждая строка — список (текст, цвет)."""
     kb = VkKeyboard(one_time=one_time)
     for row_idx, row in enumerate(rows):
         for label, color in row:
@@ -228,85 +287,108 @@ def build_keyboard(rows, one_time=False):
             kb.add_line()
     return kb.get_keyboard()
 
-
-def main_menu_kb():
+def main_keyboard():
     return build_keyboard([
         [("📅 Расписание", VkKeyboardColor.PRIMARY),
          ("📝 Домашка", VkKeyboardColor.PRIMARY)],
-        [("⏰ Напоминания", VkKeyboardColor.PRIMARY),
-         ("🏆 Оценки", VkKeyboardColor.POSITIVE)],
-        [("📚 Учёба (ЦОК)", VkKeyboardColor.POSITIVE),
-         ("🎯 Цели недели", VkKeyboardColor.POSITIVE)],
-        [("⭐ Мотивация", VkKeyboardColor.SECONDARY),
-         ("💡 Совет дня", VkKeyboardColor.SECONDARY)],
-        [("ℹ️ Помощь", VkKeyboardColor.SECONDARY)],
+        [("🤖 ИИ-тьютор", VkKeyboardColor.POSITIVE),
+         ("⏰ Напоминания", VkKeyboardColor.PRIMARY)],
+        [("🏆 Оценки", VkKeyboardColor.POSITIVE),
+         ("📊 Анализ недели", VkKeyboardColor.POSITIVE)],
+        [("📈 Мой прогресс", VkKeyboardColor.PRIMARY),
+         ("🎯 Мой уровень", VkKeyboardColor.PRIMARY)],
+        [("📚 Учёба (ЦОК)", VkKeyboardColor.PRIMARY),
+         ("⭐ Мотивация", VkKeyboardColor.SECONDARY)],
+        [("💡 Совет дня", VkKeyboardColor.SECONDARY),
+         ("ℹ️ Помощь", VkKeyboardColor.SECONDARY)],
     ])
 
-
-def schedule_menu_kb():
+def schedule_menu_keyboard():
     return build_keyboard([
-        [("➕ Добавить урок", VkKeyboardColor.PRIMARY),
-         ("📋 Показать расписание", VkKeyboardColor.PRIMARY)],
-        [("🗑 Удалить расписание дня", VkKeyboardColor.NEGATIVE)],
+        [("⚙️ Настроить расписание", VkKeyboardColor.PRIMARY)],
+        [("📋 На сегодня", VkKeyboardColor.PRIMARY),
+         ("📋 На неделю", VkKeyboardColor.PRIMARY)],
+        [("🗑 Очистить расписание", VkKeyboardColor.NEGATIVE)],
+        [("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+    ])
+
+def grade_keyboard():
+    return build_keyboard([
+        [("5 класс", VkKeyboardColor.PRIMARY), ("6 класс", VkKeyboardColor.PRIMARY)],
+        [("7 класс", VkKeyboardColor.PRIMARY), ("8 класс", VkKeyboardColor.PRIMARY)],
+        [("9 класс", VkKeyboardColor.PRIMARY)],
+        [("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+    ])
+
+def day_keyboard():
+    return build_keyboard([
+        [("Понедельник", VkKeyboardColor.PRIMARY), ("Вторник", VkKeyboardColor.PRIMARY)],
+        [("Среда", VkKeyboardColor.PRIMARY), ("Четверг", VkKeyboardColor.PRIMARY)],
+        [("Пятница", VkKeyboardColor.PRIMARY), ("Суббота", VkKeyboardColor.PRIMARY)],
+        [("Воскресенье", VkKeyboardColor.PRIMARY)],
         [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
     ])
 
-
-def homework_menu_kb():
+def sched_type_keyboard():
     return build_keyboard([
-        [("➕ Добавить задание", VkKeyboardColor.PRIMARY),
-         ("📋 Показать задания", VkKeyboardColor.PRIMARY)],
-        [("🗑 Удалить задание", VkKeyboardColor.NEGATIVE)],
-        [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
+        [("📖 Школьный предмет", VkKeyboardColor.PRIMARY),
+         ("🎯 Кружок/секция", VkKeyboardColor.POSITIVE)],
+        [("✅ Готово с днём", VkKeyboardColor.SECONDARY),
+         ("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
     ])
 
+def subjects_for_grade_keyboard(grade, added=None):
+    subjects = GRADE_SUBJECTS.get(grade, [])
+    if added is None:
+        added = set()
+    rows = []
+    for i in range(0, len(subjects), 2):
+        row = []
+        for s in subjects[i:i+2]:
+            mark = " ✅" if s in added else ""
+            row.append((s + mark, VkKeyboardColor.PRIMARY))
+        rows.append(row)
+    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
+    return build_keyboard(rows)
 
-def reminders_menu_kb():
-    return build_keyboard([
-        [("➕ Добавить напоминание", VkKeyboardColor.PRIMARY),
-         ("📋 Показать напоминания", VkKeyboardColor.PRIMARY)],
-        [("🗑 Удалить напоминание", VkKeyboardColor.NEGATIVE)],
-        [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
-    ])
+def extra_keyboard():
+    rows = []
+    for i in range(0, len(EXTRA_ACTIVITIES), 2):
+        row = []
+        for a in EXTRA_ACTIVITIES[i:i+2]:
+            row.append((a, VkKeyboardColor.POSITIVE))
+        rows.append(row)
+    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
+    return build_keyboard(rows)
 
+def time_keyboard():
+    rows = []
+    for i in range(0, len(TIMES), 3):
+        row = []
+        for t in TIMES[i:i+3]:
+            row.append((t, VkKeyboardColor.SECONDARY))
+        rows.append(row)
+    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
+    return build_keyboard(rows)
 
-def grades_menu_kb():
-    return build_keyboard([
-        [("➕ Добавить оценку", VkKeyboardColor.PRIMARY),
-         ("📋 Показать оценки", VkKeyboardColor.PRIMARY)],
-        [("📊 Средний балл", VkKeyboardColor.POSITIVE)],
-        [("🗑 Очистить предмет", VkKeyboardColor.NEGATIVE)],
-        [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
-    ])
+def categories_keyboard():
+    cats = list(SUBJECT_CATEGORIES.keys())
+    rows = []
+    for i in range(0, len(cats), 2):
+        row = []
+        for c in cats[i:i+2]:
+            row.append((f"📁 {c}", VkKeyboardColor.PRIMARY))
+        rows.append(row)
+    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
+    return build_keyboard(rows)
 
-
-def goals_menu_kb():
-    return build_keyboard([
-        [("➕ Поставить цель", VkKeyboardColor.PRIMARY),
-         ("📋 Мои цели", VkKeyboardColor.PRIMARY)],
-        [("✅ Отметить выполнение", VkKeyboardColor.POSITIVE)],
-        [("🗑 Удалить цель", VkKeyboardColor.NEGATIVE)],
-        [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
-    ])
-
-
-def study_menu_kb():
-    return build_keyboard([
-        [("📁 Основные", VkKeyboardColor.PRIMARY),
-         ("📁 Естественные", VkKeyboardColor.PRIMARY)],
-        [("📁 Гуманитарные", VkKeyboardColor.PRIMARY),
-         ("📁 Творчество и спорт", VkKeyboardColor.PRIMARY)],
-        [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
-    ])
-
-
-def subjects_kb(category):
+def subjects_keyboard(category):
     subjects = SUBJECT_CATEGORIES.get(category, [])
     rows = []
     for i in range(0, len(subjects), 2):
         row = []
-        for subj in subjects[i:i + 2]:
-            row.append((subj, VkKeyboardColor.POSITIVE))
+        for s in subjects[i:i+2]:
+            row.append((s, VkKeyboardColor.POSITIVE))
         rows.append(row)
     rows.append([
         ("⬅️ К категориям", VkKeyboardColor.SECONDARY),
@@ -314,972 +396,627 @@ def subjects_kb(category):
     ])
     return build_keyboard(rows)
 
-
-def days_kb():
-    rows = []
-    for i in range(0, len(DAYS_OF_WEEK), 2):
-        row = []
-        for d in DAYS_OF_WEEK[i:i + 2]:
-            row.append((d, VkKeyboardColor.PRIMARY))
-        rows.append(row)
-    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
-    return build_keyboard(rows)
-
-
-def cancel_kb():
+def homework_keyboard():
     return build_keyboard([
-        [("❌ Отмена", VkKeyboardColor.NEGATIVE)],
+        [("➕ Добавить ДЗ", VkKeyboardColor.PRIMARY),
+         ("📋 Показать всё", VkKeyboardColor.SECONDARY)],
+        [("✅ Отметить выполнено", VkKeyboardColor.POSITIVE),
+         ("🗑 Удалить", VkKeyboardColor.NEGATIVE)],
+        [("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
     ])
 
-
-def goals_list_kb(goals):
-    rows = []
-    for i, goal in enumerate(goals):
-        mark = "✅" if goal.get("done") else "⬜"
-        label = f"{mark} {i + 1}. {goal['text'][:30]}"
-        rows.append([(label, VkKeyboardColor.SECONDARY)])
-    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
-    return build_keyboard(rows)
-
-
-def homework_list_kb(homework):
-    rows = []
-    for i, hw in enumerate(homework):
-        label = f"{i + 1}. {hw['subject']} — {hw['text'][:25]}"
-        rows.append([(label, VkKeyboardColor.SECONDARY)])
-    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
-    return build_keyboard(rows)
-
-
-def grades_subjects_kb(grades):
-    subjects = list(grades.keys())
-    rows = []
-    for i in range(0, len(subjects), 2):
-        row = []
-        for s in subjects[i:i + 2]:
-            row.append((s, VkKeyboardColor.POSITIVE))
-        rows.append(row)
-    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
-    return build_keyboard(rows)
-
-
-def schedule_days_kb(schedules):
-    days = list(schedules.keys())
-    if not days:
-        return build_keyboard([
-            [("⬅️ Назад", VkKeyboardColor.SECONDARY)],
-        ])
-    rows = []
-    for d in days:
-        rows.append([(f"🗑 {d}", VkKeyboardColor.NEGATIVE)])
-    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
-    return build_keyboard(rows)
-
-
-def reminders_list_kb(reminders):
-    rows = []
-    for i, rem in enumerate(reminders):
-        label = f"{i + 1}. {rem['text'][:30]}"
-        rows.append([(label, VkKeyboardColor.SECONDARY)])
-    rows.append([("⬅️ Назад", VkKeyboardColor.SECONDARY)])
-    return build_keyboard(rows)
-
-
-# ============================================================
-#  ОТПРАВКА СООБЩЕНИЙ
-# ============================================================
-
-def send_msg(user_id, text, keyboard=None):
-    """Отправка сообщения с защитой от частых запросов."""
-    now = time.time()
-    if user_id in last_message_time:
-        if now - last_message_time[user_id] < MIN_INTERVAL:
-            time.sleep(MIN_INTERVAL)
-    last_message_time[user_id] = now
-
-    try:
-        kwargs = {
-            "user_id": user_id,
-            "message": text,
-            "random_id": random.randint(0, 2 ** 31 - 1),
-        }
-        if keyboard is not None:
-            kwargs["keyboard"] = keyboard
-        vk.messages.send(**kwargs)
-    except vk_api.exceptions.ApiError as e:
-        print(f"[VK API ERROR] user={user_id}: {e}")
-    except Exception as e:
-        print(f"[SEND ERROR] user={user_id}: {e}")
-
-
-# ============================================================
-#  УПРАВЛЕНИЕ СОСТОЯНИЯМИ
-# ============================================================
-
-def set_state(user_id, state, data=None):
-    user_states[user_id] = {"state": state, "data": data or {}}
-
-
-def get_state(user_id):
-    return user_states.get(user_id)
-
-
-def clear_state(user_id):
-    if user_id in user_states:
-        del user_states[user_id]
-
-
-# ============================================================
-#  ХЕЛПЕРЫ
-# ============================================================
-
-def get_original_text(user_id, lower_text):
-    """Возвращает оригинальный текст (с заглавными), если сохранён."""
-    return original_texts.get(user_id, lower_text)
-
-
-def parse_day(text):
-    """Парсит день недели из текста. Возвращает название или None."""
-    for d in DAYS_OF_WEEK:
-        if text == d.lower():
-            return d
-    return DAYS_SHORT.get(text)
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — ГЛАВНОЕ МЕНЮ
-# ============================================================
-
-def handle_main_menu(user_id, text):
-    """Обработка кнопок главного меню."""
-    if text in ("начать", "меню", "🏠 главное меню", "/start", "start",
-                "привет", "hi", "hello", "привет!", "здравствуй"):
-        data = get_user_data(user_id)
-        name = data.get("name")
-        greeting = "Привет! 👋\n\n"
-        greeting += f"Я «{BOT_NAME}» — твой помощник в учёбе.\n"
-        greeting += "Выбери, что нужно:"
-        send_msg(user_id, greeting, main_menu_kb())
-        return True
-
-    if text == "📅 расписание":
-        send_msg(user_id, "📅 Расписание уроков\n\nЧто сделать?", schedule_menu_kb())
-        return True
-
-    if text == "📝 домашка":
-        send_msg(user_id, "📝 Домашние задания\n\nЧто сделать?", homework_menu_kb())
-        return True
-
-    if text == "⏰ напоминания":
-        send_msg(user_id, "⏰ Напоминания\n\nЧто сделать?", reminders_menu_kb())
-        return True
-
-    if text == "🏆 оценки":
-        send_msg(user_id, "🏆 Оценки\n\nЧто сделать?", grades_menu_kb())
-        return True
-
-    if text == "📚 учёба (цок)":
-        send_msg(user_id, "📚 Учебные материалы\n\nВыбери категорию:", study_menu_kb())
-        return True
-
-    if text == "🎯 цели недели":
-        send_msg(user_id, "🎯 Цели недели\n\nЧто сделать?", goals_menu_kb())
-        return True
-
-    if text == "⭐ мотивация":
-        handle_motivation(user_id)
-        return True
-
-    if text == "💡 совет дня":
-        handle_tip(user_id)
-        return True
-
-    if text == "ℹ️ помощь":
-        handle_help(user_id)
-        return True
-
-    return False
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — РАСПИСАНИЕ
-# ============================================================
-
-def handle_schedule_menu(user_id, text):
-    if text == "➕ добавить урок":
-        send_msg(user_id, "Выбери день недели:", days_kb())
-        set_state(user_id, "schedule_day")
-        return True
-
-    if text == "📋 показать расписание":
-        handle_schedule_show(user_id)
-        return True
-
-    if text == "🗑 удалить расписание дня":
-        data = get_user_data(user_id)
-        if not data["schedules"]:
-            send_msg(user_id, "Расписание пока пустое. Добавь уроки сначала!",
-                     schedule_menu_kb())
-            return True
-        send_msg(user_id, "Выбери день для удаления:",
-                 schedule_days_kb(data["schedules"]))
-        set_state(user_id, "schedule_delete_day")
-        return True
-
-    if text == "⬅️ назад":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    return False
-
-
-def handle_schedule_day(user_id, text):
-    """Пользователь выбрал день — спрашиваем предмет."""
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Расписание:", schedule_menu_kb())
-        return True
-
-    day = parse_day(text)
-    if not day:
-        send_msg(user_id, "Не понял день. Выбери из кнопок:", days_kb())
-        return True
-
-    set_state(user_id, "schedule_subject", {"day": day})
-    send_msg(user_id,
-             f"День: {day}\n\nВведи название предмета (например, «Математика»):",
-             cancel_kb())
-    return True
-
-
-def handle_schedule_subject(user_id, text):
-    state = get_state(user_id)
-    if not state or state["state"] != "schedule_subject":
-        return False
-
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Расписание:", schedule_menu_kb())
-        return True
-
-    day = state["data"]["day"]
-    subject = get_original_text(user_id, text)
-
-    data = get_user_data(user_id)
-    if day not in data["schedules"]:
-        data["schedules"][day] = []
-    data["schedules"][day].append(subject)
-
-    clear_state(user_id)
-    send_msg(user_id,
-             f"✅ Урок «{subject}» добавлен в {day}!",
-             schedule_menu_kb())
-    return True
-
-
-def handle_schedule_delete_day(user_id, text):
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Расписание:", schedule_menu_kb())
-        return True
-
-    data = get_user_data(user_id)
-    day_text = text.replace("🗑", "").strip()
-    day = parse_day(day_text)
-    if day and day in data["schedules"]:
-        del data["schedules"][day]
-        clear_state(user_id)
-        send_msg(user_id, f"✅ Расписание на {day} удалено!",
-                 schedule_menu_kb())
-        return True
-
-    send_msg(user_id, "Не нашёл такой день. Попробуй ещё раз.",
-             schedule_menu_kb())
-    return True
-
-
-def handle_schedule_show(user_id):
-    data = get_user_data(user_id)
-    if not data["schedules"]:
-        send_msg(user_id, "Расписание пока пустое. Добавь уроки!",
-                 schedule_menu_kb())
-        return
-
-    msg = "📅 Твоё расписание:\n\n"
-    for day in DAYS_OF_WEEK:
-        if day in data["schedules"] and data["schedules"][day]:
-            lessons = data["schedules"][day]
-            msg += f"📌 {day}:\n"
-            for i, subj in enumerate(lessons, 1):
-                msg += f"   {i}. {subj}\n"
-            msg += "\n"
-    send_msg(user_id, msg, schedule_menu_kb())
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — ДОМАШНИЕ ЗАДАНИЯ
-# ============================================================
-
-def handle_homework_menu(user_id, text):
-    if text == "➕ добавить задание":
-        set_state(user_id, "hw_subject")
-        send_msg(user_id, "Введи предмет (например, «Математика»):",
-                 cancel_kb())
-        return True
-
-    if text == "📋 показать задания":
-        handle_homework_show(user_id)
-        return True
-
-    if text == "🗑 удалить задание":
-        data = get_user_data(user_id)
-        if not data["homework"]:
-            send_msg(user_id, "Заданий пока нет.", homework_menu_kb())
-            return True
-        send_msg(user_id, "Выбери задание для удаления:",
-                 homework_list_kb(data["homework"]))
-        set_state(user_id, "hw_delete")
-        return True
-
-    if text == "⬅️ назад":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    return False
-
-
-def handle_homework_subject(user_id, text):
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Домашка:", homework_menu_kb())
-        return True
-
-    subject = get_original_text(user_id, text)
-    set_state(user_id, "hw_text", {"subject": subject})
-    send_msg(user_id,
-             f"Предмет: {subject}\n\nВведи текст задания:",
-             cancel_kb())
-    return True
-
-
-def handle_homework_text(user_id, text):
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Домашка:", homework_menu_kb())
-        return True
-
-    state = get_state(user_id)
-    subject = state["data"]["subject"]
-    hw_text = get_original_text(user_id, text)
-
-    data = get_user_data(user_id)
-    data["homework"].append({
-        "subject": subject,
-        "text": hw_text,
-        "date": datetime.now().strftime("%d.%m.%Y"),
-    })
-
-    clear_state(user_id)
-    send_msg(user_id,
-             f"✅ Задание добавлено!\nПредмет: {subject}\nЗадание: {hw_text}",
-             homework_menu_kb())
-    return True
-
-
-def handle_homework_show(user_id):
-    data = get_user_data(user_id)
-    if not data["homework"]:
-        send_msg(user_id, "Заданий пока нет. Добавь новое!",
-                 homework_menu_kb())
-        return
-
-    msg = "📝 Твои домашние задания:\n\n"
-    for i, hw in enumerate(data["homework"], 1):
-        msg += f"{i}. 📚 {hw['subject']}\n"
-        msg += f"   {hw['text']}\n"
-        msg += f"   📅 {hw['date']}\n\n"
-    send_msg(user_id, msg, homework_menu_kb())
-
-
-def handle_homework_delete(user_id, text):
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Домашка:", homework_menu_kb())
-        return True
-
-    data = get_user_data(user_id)
-    match = re.match(r"(\d+)\.", text)
-    if match:
-        idx = int(match.group(1)) - 1
-        if 0 <= idx < len(data["homework"]):
-            removed = data["homework"].pop(idx)
-            clear_state(user_id)
-            send_msg(user_id,
-                     f"✅ Удалено: {removed['subject']} — {removed['text']}",
-                     homework_menu_kb())
-            return True
-
-    send_msg(user_id, "Не нашёл задание. Попробуй ещё раз.",
-             homework_menu_kb())
-    return True
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — НАПОМИНАНИЯ
-# ============================================================
-
-def handle_reminders_menu(user_id, text):
-    if text == "➕ добавить напоминание":
-        set_state(user_id, "reminder_text")
-        send_msg(user_id, "Введи текст напоминания:", cancel_kb())
-        return True
-
-    if text == "📋 показать напоминания":
-        handle_reminders_show(user_id)
-        return True
-
-    if text == "🗑 удалить напоминание":
-        data = get_user_data(user_id)
-        if not data["reminders"]:
-            send_msg(user_id, "Напоминаний пока нет.", reminders_menu_kb())
-            return True
-        send_msg(user_id, "Выбери напоминание для удаления:",
-                 reminders_list_kb(data["reminders"]))
-        set_state(user_id, "reminder_delete")
-        return True
-
-    if text == "⬅️ назад":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    return False
-
-
-def handle_reminder_text(user_id, text):
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Напоминания:", reminders_menu_kb())
-        return True
-
-    rem_text = get_original_text(user_id, text)
-    data = get_user_data(user_id)
-    data["reminders"].append({
-        "text": rem_text,
-        "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
-    })
-
-    clear_state(user_id)
-    send_msg(user_id,
-             f"✅ Напоминание добавлено:\n{rem_text}",
-             reminders_menu_kb())
-    return True
-
-
-def handle_reminders_show(user_id):
-    data = get_user_data(user_id)
-    if not data["reminders"]:
-        send_msg(user_id, "Напоминаний пока нет.", reminders_menu_kb())
-        return
-
-    msg = "⏰ Твои напоминания:\n\n"
-    for i, rem in enumerate(data["reminders"], 1):
-        msg += f"{i}. {rem['text']}\n   📅 {rem['date']}\n\n"
-    send_msg(user_id, msg, reminders_menu_kb())
-
-
-def handle_reminder_delete(user_id, text):
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Напоминания:", reminders_menu_kb())
-        return True
-
-    data = get_user_data(user_id)
-    match = re.match(r"(\d+)\.", text)
-    if match:
-        idx = int(match.group(1)) - 1
-        if 0 <= idx < len(data["reminders"]):
-            removed = data["reminders"].pop(idx)
-            clear_state(user_id)
-            send_msg(user_id,
-                     f"✅ Удалено: {removed['text']}",
-                     reminders_menu_kb())
-            return True
-
-    send_msg(user_id, "Не нашёл напоминание.", reminders_menu_kb())
-    return True
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — ОЦЕНКИ
-# ============================================================
-
-def handle_grades_menu(user_id, text):
-    if text == "➕ добавить оценку":
-        set_state(user_id, "grade_subject")
-        send_msg(user_id, "Введи предмет:", cancel_kb())
-        return True
-
-    if text == "📋 показать оценки":
-        handle_grades_show(user_id)
-        return True
-
-    if text == "📊 средний балл":
-        handle_grades_average(user_id)
-        return True
-
-    if text == "🗑 очистить предмет":
-        data = get_user_data(user_id)
-        if not data["grades"]:
-            send_msg(user_id, "Оценок пока нет.", grades_menu_kb())
-            return True
-        send_msg(user_id, "Выбери предмет для очистки:",
-                 grades_subjects_kb(data["grades"]))
-        set_state(user_id, "grade_clear")
-        return True
-
-    if text == "⬅️ назад":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    return False
-
-
-def handle_grade_subject(user_id, text):
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Оценки:", grades_menu_kb())
-        return True
-
-    subject = get_original_text(user_id, text)
-    set_state(user_id, "grade_value", {"subject": subject})
-    send_msg(user_id,
-             f"Предмет: {subject}\n\nВведи оценку (от 1 до 5):",
-             cancel_kb())
-    return True
-
-
-def handle_grade_value(user_id, text):
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Оценки:", grades_menu_kb())
-        return True
-
-    state = get_state(user_id)
-    subject = state["data"]["subject"]
-
-    try:
-        grade = int(text.strip())
-    except ValueError:
-        send_msg(user_id, "Введи число от 1 до 5:", cancel_kb())
-        return True
-
-    if grade < 1 or grade > 5:
-        send_msg(user_id, "Оценка должна быть от 1 до 5!", cancel_kb())
-        return True
-
-    data = get_user_data(user_id)
-    if subject not in data["grades"]:
-        data["grades"][subject] = []
-    data["grades"][subject].append({
-        "grade": grade,
-        "date": datetime.now().strftime("%d.%m.%Y"),
-    })
-
-    clear_state(user_id)
-    send_msg(user_id,
-             f"✅ Оценка {grade} по предмету «{subject}» добавлена!",
-             grades_menu_kb())
-    return True
-
-
-def handle_grades_show(user_id):
-    data = get_user_data(user_id)
-    if not data["grades"]:
-        send_msg(user_id, "Оценок пока нет. Добавь первую!",
-                 grades_menu_kb())
-        return
-
-    msg = "🏆 Твои оценки:\n\n"
-    for subject, grades in data["grades"].items():
-        grades_str = ", ".join(str(g["grade"]) for g in grades)
-        msg += f"📚 {subject}: {grades_str}\n"
-    send_msg(user_id, msg, grades_menu_kb())
-
-
-def handle_grades_average(user_id):
-    data = get_user_data(user_id)
-    if not data["grades"]:
-        send_msg(user_id, "Оценок пока нет. Добавь хотя бы одну!",
-                 grades_menu_kb())
-        return
-
-    msg = "📊 Средний балл по предметам:\n\n"
-    total_sum = 0
-    total_count = 0
-    for subject, grades in data["grades"].items():
-        if grades:
-            s = sum(g["grade"] for g in grades)
-            c = len(grades)
-            avg = s / c
-            total_sum += s
-            total_count += c
-            msg += f"📚 {subject}: {avg:.2f} (оценок: {c})\n"
-
-    if total_count > 0:
-        overall = total_sum / total_count
-        msg += f"\n📌 Общий средний балл: {overall:.2f}"
-    send_msg(user_id, msg, grades_menu_kb())
-
-
-def handle_grade_clear(user_id, text):
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Оценки:", grades_menu_kb())
-        return True
-
-    data = get_user_data(user_id)
-    subject = get_original_text(user_id, text)
-    if subject in data["grades"]:
-        del data["grades"][subject]
-        clear_state(user_id)
-        send_msg(user_id, f"✅ Оценки по «{subject}» очищены!",
-                 grades_menu_kb())
-        return True
-
-    send_msg(user_id, "Не нашёл предмет.", grades_menu_kb())
-    return True
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — ЦЕЛИ НЕДЕЛИ
-# ============================================================
-
-def handle_goals_menu(user_id, text):
-    if text == "➕ поставить цель":
-        set_state(user_id, "goal_add")
-        send_msg(user_id, "Введи текст цели:", cancel_kb())
-        return True
-
-    if text == "📋 мои цели":
-        handle_goals_show(user_id)
-        return True
-
-    if text == "✅ отметить выполнение":
-        data = get_user_data(user_id)
-        if not data["goals"]:
-            send_msg(user_id, "Целей пока нет.", goals_menu_kb())
-            return True
-        send_msg(user_id, "Выбери цель:", goals_list_kb(data["goals"]))
-        set_state(user_id, "goal_done")
-        return True
-
-    if text == "🗑 удалить цель":
-        data = get_user_data(user_id)
-        if not data["goals"]:
-            send_msg(user_id, "Целей пока нет.", goals_menu_kb())
-            return True
-        send_msg(user_id, "Выбери цель для удаления:",
-                 goals_list_kb(data["goals"]))
-        set_state(user_id, "goal_delete")
-        return True
-
-    if text == "⬅️ назад":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    return False
-
-
-def handle_goal_add(user_id, text):
-    if text == "❌ отмена":
-        clear_state(user_id)
-        send_msg(user_id, "Отменено. Цели:", goals_menu_kb())
-        return True
-
-    goal_text = get_original_text(user_id, text)
-    data = get_user_data(user_id)
-    data["goals"].append({"text": goal_text, "done": False})
-
-    clear_state(user_id)
-    send_msg(user_id,
-             f"✅ Цель добавлена: {goal_text}",
-             goals_menu_kb())
-    return True
-
-
-def handle_goals_show(user_id):
-    data = get_user_data(user_id)
-    if not data["goals"]:
-        send_msg(user_id, "Целей пока нет. Поставь первую!",
-                 goals_menu_kb())
-        return
-
-    msg = "🎯 Твои цели на неделю:\n\n"
-    for i, goal in enumerate(data["goals"], 1):
-        mark = "✅" if goal["done"] else "⬜"
-        msg += f"{mark} {i}. {goal['text']}\n"
-    done_count = sum(1 for g in data["goals"] if g["done"])
-    msg += f"\n📊 Выполнено: {done_count} из {len(data['goals'])}"
-    send_msg(user_id, msg, goals_menu_kb())
-
-
-def handle_goal_done(user_id, text):
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Цели:", goals_menu_kb())
-        return True
-
-    data = get_user_data(user_id)
-    match = re.match(r"[✅⬜]\s*(\d+)\.", text)
-    if match:
-        idx = int(match.group(1)) - 1
-        if 0 <= idx < len(data["goals"]):
-            data["goals"][idx]["done"] = not data["goals"][idx]["done"]
-            status = ("✅ выполнено" if data["goals"][idx]["done"]
-                      else "⬜ не выполнено")
-            clear_state(user_id)
-            send_msg(user_id,
-                     f"Статус изменён: {status}\n"
-                     f"Цель: {data['goals'][idx]['text']}",
-                     goals_menu_kb())
-            return True
-
-    send_msg(user_id, "Не нашёл цель.", goals_menu_kb())
-    return True
-
-
-def handle_goal_delete(user_id, text):
-    if text == "⬅️ назад":
-        clear_state(user_id)
-        send_msg(user_id, "Цели:", goals_menu_kb())
-        return True
-
-    data = get_user_data(user_id)
-    match = re.match(r"[✅⬜]\s*(\d+)\.", text)
-    if match:
-        idx = int(match.group(1)) - 1
-        if 0 <= idx < len(data["goals"]):
-            removed = data["goals"].pop(idx)
-            clear_state(user_id)
-            send_msg(user_id,
-                     f"✅ Удалено: {removed['text']}",
-                     goals_menu_kb())
-            return True
-
-    send_msg(user_id, "Не нашёл цель.", goals_menu_kb())
-    return True
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — УЧЕБНЫЕ МАТЕРИАЛЫ (ЦОК)
-# ============================================================
-
-def handle_study_menu(user_id, text):
-    # Кнопка "Назад"
-    if text == "⬅️ назад":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    # Кнопка "К категориям"
-    if text == "⬅️ к категориям":
-        send_msg(user_id, "Выбери категорию:", study_menu_kb())
-        return True
-
-    # Кнопка "Главное меню"
-    if text == "🏠 главное меню":
-        send_msg(user_id, "Главное меню:", main_menu_kb())
-        return True
-
-    # Категории
-    for cat in SUBJECT_CATEGORIES:
-        if text == f"📁 {cat.lower()}":
-            send_msg(user_id,
-                     f"Предметы категории «{cat}»:\nВыбери предмет:",
-                     subjects_kb(cat))
-            return True
-
-    # Проверяем, не предмет ли это
-    for cat, subjects in SUBJECT_CATEGORIES.items():
-        for subj in subjects:
-            if text == subj.lower():
-                handle_study_subject(user_id, subj)
-                return True
-
-    return False
-
-
-def handle_study_subject(user_id, subject):
-    links = EDUCATIONAL_LINKS.get(subject, DEFAULT_LINKS)
-    msg = f"📚 {subject}\n\nПолезные ресурсы:\n\n"
-    for title, url in links:
-        msg += f"• {title}\n  {url}\n\n"
-    msg += "Изучи материал и возвращайся за оценками! 💪"
-    send_msg(user_id, msg, study_menu_kb())
-
-
-# ============================================================
-#  ОБРАБОТЧИКИ — МОТИВАЦИЯ, СОВЕТЫ, ПОМОЩЬ
-# ============================================================
-
-def handle_motivation(user_id):
-    data = get_user_data(user_id)
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    if data["last_quote_date"] == today:
-        name, story = random.choice(MOTIVATION_STORIES)
-        msg = f"🌟 История вдохновения\n\n{name}\n\n{story}\n\n💪 Не сдавайся!"
-    else:
-        quote = random.choice(MORNING_QUOTES)
-        data["last_quote_date"] = today
-        msg = f"⭐ Мотивация дня\n\n{quote}"
-
-    send_msg(user_id, msg, main_menu_kb())
-
-
-def handle_tip(user_id):
-    tip = random.choice(STUDY_TIPS)
-    send_msg(user_id, tip, main_menu_kb())
-
-
-def handle_help(user_id):
-    msg = (
-        f"ℹ️ {BOT_NAME} v{VERSION}\n\n"
-        "Я помогаю школьнику в учёбе:\n\n"
-        "📅 Расписание — добавляй и смотри уроки по дням недели\n"
-        "📝 Домашка — записывай задания и не забывай\n"
-        "⏰ Напоминания — не пропусти важное\n"
-        "🏆 Оценки — следи за успеваемостью и средним баллом\n"
-        "📚 Учёба (ЦОК) — ссылки на полезные ресурсы\n"
-        "🎯 Цели недели — ставь цели и отмечай выполнение\n"
-        "⭐ Мотивация — вдохновение на каждый день\n"
-        "💡 Совет дня — полезный совет по учёбе\n\n"
-        "Нажми на кнопку меню, чтобы начать!"
+def grades_keyboard():
+    return build_keyboard([
+        [("➕ Добавить оценку", VkKeyboardColor.PRIMARY),
+         ("📊 Средний балл", VkKeyboardColor.POSITIVE)],
+        [("📋 Все оценки", VkKeyboardColor.SECONDARY),
+         ("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+    ])
+
+def reminders_keyboard():
+    return build_keyboard([
+        [("📋 Мои напоминания сегодня", VkKeyboardColor.PRIMARY)],
+        [("🔔 Включить", VkKeyboardColor.POSITIVE),
+         ("🔕 Выключить", VkKeyboardColor.NEGATIVE)],
+        [("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+    ])
+
+def ai_keyboard():
+    return build_keyboard([
+        [("📝 Спросить ИИ-тьютора", VkKeyboardColor.POSITIVE)],
+        [("📈 Мой прогресс", VkKeyboardColor.PRIMARY),
+         ("🏠 Главное меню", VkKeyboardColor.SECONDARY)],
+    ])
+
+# ─── ОТПРАВКА ───
+def send_message(user_id, text, keyboard=None):
+    vk.messages.send(
+        user_id=user_id, message=text,
+        keyboard=keyboard, random_id=random.randint(0, 2**31 - 1),
     )
-    send_msg(user_id, msg, main_menu_kb())
 
+def send_reminder(user_id, text):
+    try:
+        vk_rem.messages.send(
+            user_id=user_id, message=text,
+            random_id=random.randint(0, 2**31 - 1),
+        )
+    except Exception as e:
+        print(f"Ошибка отправки напоминания: {e}")
 
-# ============================================================
-#  ГЛАВНЫЙ ОБРАБОТЧИК
-# ============================================================
+# ─── РАСПИСАНИЕ ───
+def get_today_key():
+    return DAYS_ORDER[datetime.now().weekday()]
 
+def format_day(day_key, items):
+    name = DAYS_RU[day_key]
+    if not items:
+        return f"📅 {name}: нет занятий"
+    sorted_items = sorted(items, key=lambda x: x.get("time", "99:99"))
+    lines = [f"📅 {name}:"]
+    for i, item in enumerate(sorted_items, 1):
+        icon = "🎯" if item.get("type") == "extra" else "📖"
+        lines.append(f"  {i}. {item['time']} {icon} {item['subject']}")
+    return "\n".join(lines)
+
+def format_week(week):
+    parts = [format_day(d, week.get(d, [])) for d in DAYS_ORDER if week.get(d)]
+    return "\n\n".join(parts) if parts else "Расписание пустое."
+
+def _minus_15(t):
+    try:
+        h, m = map(int, t.split(":"))
+        total = h * 60 + m - 15
+        if total < 0:
+            total = 0
+        return f"{total // 60:02d}:{total % 60:02d}"
+    except Exception:
+        return t
+
+# ─── СОСТОЯНИЕ ───
+user_state = {}
+
+# ─── ФОНОВЫЙ ПОТОК ───
+def reminder_loop():
+    while True:
+        try:
+            now = datetime.now()
+            today_key = get_today_key()
+            current_hm = now.strftime("%H:%M")
+            today_str = now.strftime("%Y-%m-%d")
+
+            for uid_str, sched in DATA.get("schedules", {}).items():
+                if not DATA.get("reminders_on", {}).get(uid_str, True):
+                    continue
+                week = sched.get("week", {})
+                today_items = week.get(today_key, [])
+                uid = int(uid_str)
+                if uid not in sent_reminders:
+                    sent_reminders[uid] = set()
+
+                for item in today_items:
+                    t = item.get("time", "")
+                    subj = item.get("subject", "")
+                    try:
+                        h, m = map(int, t.split(":"))
+                        item_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                        rem_dt = item_dt - timedelta(minutes=15)
+                        rem_str = rem_dt.strftime("%H:%M")
+                    except Exception:
+                        continue
+
+                    key = f"{today_str}_{t}_{subj}"
+                    if current_hm == rem_str and key not in sent_reminders[uid]:
+                        icon = "🎯" if item.get("type") == "extra" else "📖"
+                        msg = f"⏰ Напоминание!\n\nЧерез 15 минут:\n{icon} {subj} в {t}\n\nПроверь, всё ли готово! 🎒"
+                        send_reminder(uid, msg)
+                        sent_reminders[uid].add(key)
+        except Exception as e:
+            print(f"Ошибка в reminder_loop: {e}")
+        time.sleep(60)
+
+# ─── ОБРАБОТКА ───
 def handle_message(event):
-    user_id = event.user_id
-    text = event.text.lower().strip()
-    original_texts[user_id] = event.text
+    text = event.text
+    uid = event.user_id
+    uid_s = str(uid)
 
-    state = get_state(user_id)
+    # Перезагружаем данные (на случай изменений из фонового потока)
+    global DATA
+    DATA = load_data()
 
-    # Если есть активное состояние — обрабатываем его
-    if state:
-        handled = handle_state(user_id, text, state)
-        if handled:
+    # ── Активное состояние ──
+    if uid in user_state:
+        st = user_state[uid]
+        step = st["step"]
+
+        # --- Настройка расписания ---
+        if step == "setup_grade":
+            if text in GRADE_SUBJECTS:
+                st["grade"] = text
+                DATA.setdefault("schedules", {}).setdefault(uid_s, {"grade": text, "week": {}})["grade"] = text
+                save_data()
+                st["step"] = "setup_day"
+                send_message(uid, "Выбери день недели:", day_keyboard())
+            else:
+                send_message(uid, "Выбери класс кнопкой 👇", grade_keyboard())
             return
 
-    # Обработка главного меню
-    if handle_main_menu(user_id, text):
+        if step == "setup_day":
+            dk = DAY_NAME_TO_KEY.get(text.lower())
+            if dk:
+                st["day"] = dk
+                st["step"] = "setup_type"
+                send_message(uid, f"🗓 {DAYS_RU[dk]}\n\nЧто добавляем?", sched_type_keyboard())
+            elif text == "⬅️ Назад":
+                del user_state[uid]
+                send_message(uid, "Меню расписания:", schedule_menu_keyboard())
+            else:
+                send_message(uid, "Выбери день кнопкой 👇", day_keyboard())
+            return
+
+        if step == "setup_type":
+            if text == "📖 Школьный предмет":
+                grade = DATA["schedules"].get(uid_s, {}).get("grade", st.get("grade", "5 класс"))
+                added = set()
+                for item in DATA["schedules"].get(uid_s, {}).get("week", {}).get(st["day"], []):
+                    if item.get("type") == "lesson":
+                        added.add(item["subject"])
+                st["step"] = "setup_subject"
+                send_message(uid, "Выбери предмет:", subjects_for_grade_keyboard(grade, added))
+            elif text == "🎯 Кружок/секция":
+                st["step"] = "setup_extra"
+                send_message(uid, "Что за занятие?", extra_keyboard())
+            elif text == "✅ Готово с днём":
+                save_data()
+                del user_state[uid]
+                pts = add_points(uid_s, 5, "настройка расписания")
+                send_message(uid, "✅ Расписание на этот день сохранено!\n+5 баллов! 🎉\n\nХочешь настроить другой день?", schedule_menu_keyboard())
+            elif text == "🏠 Главное меню":
+                save_data()
+                del user_state[uid]
+                send_message(uid, "Главное меню:", main_keyboard())
+            else:
+                send_message(uid, "Выбери кнопкой 👇", sched_type_keyboard())
+            return
+
+        if step == "setup_subject":
+            if text == "⬅️ Назад":
+                st["step"] = "setup_type"
+                send_message(uid, "Что добавляем?", sched_type_keyboard())
+                return
+            grade = DATA["schedules"].get(uid_s, {}).get("grade", st.get("grade", ""))
+            if text in GRADE_SUBJECTS.get(grade, []):
+                st["pending"] = {"subject": text, "type": "lesson"}
+                st["step"] = "setup_time"
+                send_message(uid, f"Во сколько начинается «{text}»?", time_keyboard())
+            else:
+                send_message(uid, "Выбери предмет кнопкой 👇", subjects_for_grade_keyboard(grade))
+            return
+
+        if step == "setup_extra":
+            if text == "⬅️ Назад":
+                st["step"] = "setup_type"
+                send_message(uid, "Что добавляем?", sched_type_keyboard())
+                return
+            if text == "➕ Другое":
+                st["step"] = "setup_custom"
+                send_message(uid, "Напиши название занятия текстом:")
+                return
+            if text in EXTRA_ACTIVITIES:
+                st["pending"] = {"subject": text, "type": "extra"}
+                st["step"] = "setup_time"
+                send_message(uid, f"Во сколько начинается «{text}»?", time_keyboard())
+            else:
+                send_message(uid, "Выбери кнопкой 👇", extra_keyboard())
+            return
+
+        if step == "setup_custom":
+            if text.strip():
+                st["pending"] = {"subject": text.strip(), "type": "extra"}
+                st["step"] = "setup_time"
+                send_message(uid, f"Во сколько начинается «{text.strip()}»?", time_keyboard())
+            else:
+                send_message(uid, "Напиши название занятия текстом:")
+            return
+
+        if step == "setup_time":
+            if text == "⬅️ Назад":
+                st["step"] = "setup_type"
+                send_message(uid, "Что добавляем?", sched_type_keyboard())
+                return
+            if text in TIMES:
+                day = st["day"]
+                pending = st["pending"]
+                entry = {"subject": pending["subject"], "time": text, "type": pending["type"]}
+                DATA["schedules"].setdefault(uid_s, {}).setdefault("week", {}).setdefault(day, []).append(entry)
+                save_data()
+                st["step"] = "setup_type"
+                icon = "🎯" if pending["type"] == "extra" else "📖"
+                send_message(uid, f"✅ Добавлено: {icon} {pending['subject']} в {text}\n\nЧто ещё?", sched_type_keyboard())
+            else:
+                send_message(uid, "Выбери время кнопкой 👇", time_keyboard())
+            return
+
+        # --- ИИ-тьютор: ввод темы ---
+        if step == "ai_input":
+            if text.strip() and len(text.strip()) > 2:
+                topic = text.strip()
+                grade = DATA.get("schedules", {}).get(uid_s, {}).get("grade", "")
+                track_topic(uid_s, topic)
+                del user_state[uid]
+                send_message(uid, "🤖 ИИ-тьютор думает... ⏳", ai_keyboard())
+                explanation = ai_explain(topic, grade)
+                add_points(uid_s, 20, "вопрос ИИ")
+                pts_info = points_info(uid_s)
+                full_msg = f"🤖 ИИ-тьютор:\n\n{explanation}\n\n---\n{pts_info} (+20 баллов! 🎉)"
+                send_message(uid, full_msg, ai_keyboard())
+            else:
+                send_message(uid, "Напиши тему, которую хочешь понять. Например: «дроби», «теорема Пифагора», «приставки ПРЕ и ПРИ»")
+            return
+
+        # --- Домашка ---
+        if step == "hw_input":
+            if ":" in text:
+                parts = text.split(":", 1)
+                subj = parts[0].strip()
+                desc = parts[1].strip()
+                DATA["homework"].setdefault(uid_s, []).append({"subject": subj, "desc": desc, "done": False})
+                save_data()
+                del user_state[uid]
+                add_points(uid_s, 10, "добавил ДЗ")
+                send_message(uid, f"✅ ДЗ по «{subj}» добавлено! +10 баллов! 🎉", homework_keyboard())
+            else:
+                send_message(uid, "Формат: Предмет: что задали\nПример: Математика: стр. 45 № 3,4")
+            return
+
+        if step == "hw_done":
+            hw_list = DATA.get("homework", {}).get(uid_s, [])
+            try:
+                num = int(text) - 1
+                if 0 <= num < len(hw_list):
+                    hw_list[num]["done"] = True
+                    save_data()
+                    del user_state[uid]
+                    add_points(uid_s, 15, "выполнил ДЗ")
+                    send_message(uid, "✅ Отлично! +15 баллов! 🎉", homework_keyboard())
+                    return
+            except ValueError:
+                pass
+            send_message(uid, "Напиши номер ДЗ цифрой:")
+            return
+
+        if step == "hw_del":
+            hw_list = DATA.get("homework", {}).get(uid_s, [])
+            try:
+                num = int(text) - 1
+                if 0 <= num < len(hw_list):
+                    hw_list.pop(num)
+                    save_data()
+                    del user_state[uid]
+                    send_message(uid, "🗑 Удалено!", homework_keyboard())
+                    return
+            except ValueError:
+                pass
+            send_message(uid, "Напиши номер цифрой:")
+            return
+
+        # --- Оценки ---
+        if step == "grade_input":
+            if ":" in text:
+                parts = text.split(":", 1)
+                subj = parts[0].strip()
+                val = parts[1].strip()
+                DATA["grades"].setdefault(uid_s, []).append(
+                    {"subject": subj, "grade": val, "date": datetime.now().strftime("%d.%m")})
+                save_data()
+                del user_state[uid]
+                add_points(uid_s, 10, "добавил оценку")
+                send_message(uid, f"✅ Оценка {val} по «{subj}» добавлена! +10 баллов! 🎉", grades_keyboard())
+            else:
+                send_message(uid, "Формат: Предмет: оценка\nПример: Алгебра: 4")
+            return
+
+    # ── ОСНОВНОЕ МЕНЮ ──
+    text_lower = text.lower()
+
+    if text_lower in ["начало", "начать", "привет", "меню", "🏠 главное меню", "старт"]:
+        send_message(uid,
+            "Привет! Я «Навигатор Успеха» v3.0 🎯\n\n"
+            "Что нового:\n"
+            "🤖 ИИ-тьютор — объясняет темы простыми словами\n"
+            "📊 Анализ нагрузки — помогает планировать неделю\n"
+            "📈 Трекинг прогресса — карта твоих запросов\n"
+            "🎯 Геймификация — баллы и уровни за активность\n\n"
+            "Чем займёмся?",
+            main_keyboard())
         return
 
-    # Обработка подменю (если нет активного состояния)
-    if handle_submenu(user_id, text):
+    # --- Расписание ---
+    if text == "📅 Расписание":
+        send_message(uid, "Управление расписанием:", schedule_menu_keyboard())
         return
 
-    # Если ничего не подошло
-    send_msg(user_id,
-             "Я не понял команду 🤔\n"
-             "Нажми на кнопку в меню или напиши «Начать».",
-             main_menu_kb())
+    if text == "⚙️ Настроить расписание":
+        grade = DATA.get("schedules", {}).get(uid_s, {}).get("grade")
+        if grade:
+            user_state[uid] = {"step": "setup_day"}
+            send_message(uid, f"Твой класс: {grade}\nВыбери день недели:", day_keyboard())
+        else:
+            user_state[uid] = {"step": "setup_grade"}
+            send_message(uid, "Сначала выбери класс:", grade_keyboard())
+        return
 
+    if text == "📋 На сегодня":
+        week = DATA.get("schedules", {}).get(uid_s, {}).get("week", {})
+        today = get_today_key()
+        send_message(uid, format_day(today, week.get(today, [])) +
+                     "\n\n⚠️ Я напомню за 15 минут до начала каждого занятия!",
+                     schedule_menu_keyboard())
+        return
 
-def handle_submenu(user_id, text):
-    """Обработка подменю без активного состояния."""
-    if handle_schedule_menu(user_id, text):
-        return True
-    if handle_homework_menu(user_id, text):
-        return True
-    if handle_reminders_menu(user_id, text):
-        return True
-    if handle_grades_menu(user_id, text):
-        return True
-    if handle_goals_menu(user_id, text):
-        return True
-    if handle_study_menu(user_id, text):
-        return True
-    return False
+    if text == "📋 На неделю":
+        week = DATA.get("schedules", {}).get(uid_s, {}).get("week", {})
+        if week:
+            send_message(uid, format_week(week), schedule_menu_keyboard())
+        else:
+            send_message(uid, "Расписание ещё не настроено. Нажми «Настроить расписание»!", schedule_menu_keyboard())
+        return
 
+    if text == "🗑 Очистить расписание":
+        if uid_s in DATA.get("schedules", {}):
+            DATA["schedules"][uid_s]["week"] = {}
+            save_data()
+        send_message(uid, "🗑 Расписание очищено.", schedule_menu_keyboard())
+        return
 
-def handle_state(user_id, text, state):
-    """Маршрутизация по активным состояниям."""
-    st = state["state"]
+    # --- Анализ недели ---
+    if text == "📊 Анализ недели":
+        send_message(uid, analyze_week(uid_s), main_keyboard())
+        return
 
-    handlers = {
-        "schedule_day": handle_schedule_day,
-        "schedule_subject": handle_schedule_subject,
-        "schedule_delete_day": handle_schedule_delete_day,
-        "hw_subject": handle_homework_subject,
-        "hw_text": handle_homework_text,
-        "hw_delete": handle_homework_delete,
-        "reminder_text": handle_reminder_text,
-        "reminder_delete": handle_reminder_delete,
-        "grade_subject": handle_grade_subject,
-        "grade_value": handle_grade_value,
-        "grade_clear": handle_grade_clear,
-        "goal_add": handle_goal_add,
-        "goal_done": handle_goal_done,
-        "goal_delete": handle_goal_delete,
-    }
+    # --- ИИ-тьютор ---
+    if text == "🤖 ИИ-тьютор":
+        send_message(uid,
+            "🤖 Я могу объяснить тему простыми словами!\n\n"
+            "Напиши, что не понимаешь. Например:\n"
+            "• «дроби»\n"
+            "• «теорема Пифагора»\n"
+            "• «приставки ПРЕ и ПРИ»\n"
+            "• «как работают глаголы»\n\n"
+            "Я объясню на примерах и задам проверочный вопрос 🎯",
+            ai_keyboard())
+        return
 
-    handler = handlers.get(st)
-    if handler:
-        return handler(user_id, text)
-    return False
+    if text == "📝 Спросить ИИ-тьютора":
+        user_state[uid] = {"step": "ai_input"}
+        send_message(uid, "Напиши тему, которую хочешь понять 👇", None)
+        return
 
+    # --- Трекинг прогресса ---
+    if text == "📈 Мой прогресс":
+        send_message(uid, progress_report(uid_s), ai_keyboard())
+        return
 
-# ============================================================
-#  ИНИЦИАЛИЗАЦИЯ VK API
-# ============================================================
+    # --- Геймификация ---
+    if text == "🎯 Мой уровень":
+        send_message(uid, points_info(uid_s), main_keyboard())
+        return
 
-try:
-    vk_session = vk_api.VkApi(token=TOKEN)
-    vk = vk_session.get_api()
-    longpoll = VkLongPoll(vk_session)
-except vk_api.exceptions.ApiError as e:
-    print(f"[VK API ERROR] Не удалось инициализировать: {e}")
-    sys.exit(1)
-except Exception as e:
-    print(f"[ERROR] Не удалось инициализировать: {e}")
-    sys.exit(1)
+    # --- Напоминания ---
+    if text == "⏰ Напоминания":
+        enabled = DATA.get("reminders_on", {}).get(uid_s, True)
+        status = "включены ✅" if enabled else "выключены ❌"
+        send_message(uid,
+            f"Напоминания {status}.\n\n"
+            "Я напоминаю за 15 минут до каждого урока, кружка, секции или репетиции.",
+            reminders_keyboard())
+        return
 
+    if text == "🔔 Включить":
+        DATA.setdefault("reminders_on", {})[uid_s] = True
+        save_data()
+        send_message(uid, "🔔 Напоминания включены!", reminders_keyboard())
+        return
 
-# ============================================================
-#  ОСНОВНОЙ ЦИКЛ
-# ============================================================
+    if text == "🔕 Выключить":
+        DATA.setdefault("reminders_on", {})[uid_s] = False
+        save_data()
+        send_message(uid, "🔕 Напоминания выключены.", reminders_keyboard())
+        return
 
-print("=" * 60)
-print(f"  {BOT_NAME} v{VERSION}")
-print("  Бот запущен и готов к работе!")
-print("=" * 60)
+    if text == "📋 Мои напоминания сегодня":
+        week = DATA.get("schedules", {}).get(uid_s, {}).get("week", {})
+        today = get_today_key()
+        items = week.get(today, [])
+        if not items:
+            send_message(uid, "Сегодня нет запланированных занятий.", reminders_keyboard())
+        else:
+            sorted_items = sorted(items, key=lambda x: x.get("time", "99:99"))
+            lines = ["📋 Сегодня напоминаю о:"]
+            for item in sorted_items:
+                icon = "🎯" if item.get("type") == "extra" else "📖"
+                lines.append(f"  {item['time']} {icon} {item['subject']} → напомну в {_minus_15(item['time'])}")
+            send_message(uid, "\n".join(lines), reminders_keyboard())
+        return
 
-while True:
-    try:
-        for event in longpoll.listen():
-            if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+    # --- Домашка ---
+    if text == "📝 Домашка":
+        send_message(uid, "Управление домашними заданиями:", homework_keyboard())
+        return
+
+    if text == "➕ Добавить ДЗ":
+        user_state[uid] = {"step": "hw_input"}
+        send_message(uid, "Напиши в формате:\nПредмет: что задали\n\nПример: Математика: стр. 45 № 3,4")
+        return
+
+    if text == "📋 Показать всё":
+        hw_list = DATA.get("homework", {}).get(uid_s, [])
+        if not hw_list:
+            send_message(uid, "Домашки нет! Можно отдохнуть 😎", homework_keyboard())
+        else:
+            lines = ["📋 Твоя домашка:"]
+            for i, hw in enumerate(hw_list, 1):
+                mark = "✅" if hw.get("done") else "⬜"
+                lines.append(f"{i}. {mark} {hw['subject']}: {hw['desc']}")
+            send_message(uid, "\n".join(lines), homework_keyboard())
+        return
+
+    if text == "✅ Отметить выполнено":
+        hw_list = DATA.get("homework", {}).get(uid_s, [])
+        if not hw_list:
+            send_message(uid, "Домашки нет!", homework_keyboard())
+            return
+        user_state[uid] = {"step": "hw_done"}
+        lines = ["Напиши номер выполненного ДЗ:"]
+        for i, hw in enumerate(hw_list, 1):
+            if not hw.get("done"):
+                lines.append(f"{i}. {hw['subject']}: {hw['desc']}")
+        send_message(uid, "\n".join(lines))
+        return
+
+    if text == "🗑 Удалить":
+        hw_list = DATA.get("homework", {}).get(uid_s, [])
+        if not hw_list:
+            send_message(uid, "Домашки нет!", homework_keyboard())
+            return
+        user_state[uid] = {"step": "hw_del"}
+        lines = ["Напиши номер для удаления:"]
+        for i, hw in enumerate(hw_list, 1):
+            lines.append(f"{i}. {hw['subject']}: {hw['desc']}")
+        send_message(uid, "\n".join(lines))
+        return
+
+    # --- Оценки ---
+    if text == "🏆 Оценки":
+        send_message(uid, "Управление оценками:", grades_keyboard())
+        return
+
+    if text == "➕ Добавить оценку":
+        user_state[uid] = {"step": "grade_input"}
+        send_message(uid, "Напиши в формате:\nПредмет: оценка\n\nПример: Алгебра: 4")
+        return
+
+    if text == "📊 Средний балл":
+        gr_list = DATA.get("grades", {}).get(uid_s, [])
+        if not gr_list:
+            send_message(uid, "Оценок пока нет.", grades_keyboard())
+            return
+        by_subj = {}
+        for g in gr_list:
+            by_subj.setdefault(g["subject"], []).append(g["grade"])
+        lines = ["📊 Средний балл по предметам:"]
+        total_nums = []
+        for subj, grades in by_subj.items():
+            nums = []
+            for gr in grades:
                 try:
-                    handle_message(event)
-                except Exception as e:
-                    print(f"[ERROR] Ошибка обработки сообщения: {e}")
-                    user_id = event.user_id
-                    try:
-                        send_msg(user_id,
-                                 "Произошла ошибка 😅 "
-                                 "Попробуй ещё раз — напиши «Начать».",
-                                 main_menu_kb())
-                    except Exception:
-                        pass
-    except KeyboardInterrupt:
-        print("\nБот остановлен пользователем.")
-        break
-    except Exception as e:
-        print(f"[CRITICAL] Ошибка в цикле: {e}")
-        time.sleep(5)
-        print("Переподключение...")
-        continue
+                    nums.append(float(gr.replace(",", ".")))
+                except ValueError:
+                    pass
+            if nums:
+                avg = sum(nums) / len(nums)
+                total_nums.extend(nums)
+                lines.append(f"  {subj}: {avg:.2f}")
+        if total_nums:
+            lines.append(f"\n📈 Общий средний: {sum(total_nums) / len(total_nums):.2f}")
+        send_message(uid, "\n".join(lines), grades_keyboard())
+        return
+
+    if text == "📋 Все оценки":
+        gr_list = DATA.get("grades", {}).get(uid_s, [])
+        if not gr_list:
+            send_message(uid, "Оценок пока нет.", grades_keyboard())
+        else:
+            lines = ["📋 Все оценки:"]
+            for i, g in enumerate(gr_list, 1):
+                lines.append(f"{i}. {g['date']} — {g['subject']}: {g['grade']}")
+            send_message(uid, "\n".join(lines), grades_keyboard())
+        return
+
+    # --- ЦОК ---
+    if text == "📚 Учёба (ЦОК)":
+        send_message(uid, "Выбери категорию предметов:", categories_keyboard())
+        return
+
+    for cat in SUBJECT_CATEGORIES:
+        if text == f"📁 {cat}":
+            send_message(uid, f"Предметы категории «{cat}»:", subjects_keyboard(cat))
+            return
+
+    if text == "⬅️ К категориям":
+        send_message(uid, "Выбери категорию:", categories_keyboard())
+        return
+
+    # --- Мотивация ---
+    if text == "⭐ Мотивация":
+        send_message(uid, random.choice(MORNING_QUOTES), main_keyboard())
+        return
+
+    if text == "💡 Совет дня":
+        send_message(uid, random.choice(STUDY_TIPS), main_keyboard())
+        return
+
+    # --- Помощь ---
+    if text == "ℹ️ Помощь":
+        send_message(uid,
+            "🤖 Навигатор Успеха v3.0\n\n"
+            "Что я умею:\n"
+            "🤖 ИИ-тьютор — объясняю темы простыми словами\n"
+            "📅 Расписание — настрой на неделю, я напомню\n"
+            "📝 Домашка — список заданий, отметка о выполнении\n"
+            "⏰ Напоминания — автоматические за 15 минут до урока/секции\n"
+            "🏆 Оценки — журнал и средний балл\n"
+            "📊 Анализ недели — где перегрузка, как планировать\n"
+            "📈 Мой прогресс — карта запросов к ИИ\n"
+            "🎯 Мой уровень — баллы за активность\n"
+            "📚 Учёба (ЦОК) — навигация по предметам\n\n"
+            "Начни с настройки расписания!",
+            main_keyboard())
+        return
+
+    if text == "⬅️ Назад":
+        send_message(uid, "Главное меню:", main_keyboard())
+        return
+
+    # --- Не распознано ---
+    # Если текст начинается с "объясни" — отправляем в ИИ
+    if text_lower.startswith("объясни") or text_lower.startswith("не понял") or text_lower.startswith("не понимаю"):
+        topic = text
+        for prefix in ["объясни ", "не понял ", "не понимаю ", "объясни", "не понял", "не понимаю"]:
+            if topic.lower().startswith(prefix):
+                topic = topic[len(prefix):].strip()
+                break
+        if topic and len(topic) > 2:
+            grade = DATA.get("schedules", {}).get(uid_s, {}).get("grade", "")
+            track_topic(uid_s, topic)
+            send_message(uid, "🤖 ИИ-тьютор думает... ⏳", ai_keyboard())
+            explanation = ai_explain(topic, grade)
+            add_points(uid_s, 20, "вопрос ИИ")
+            pts_info = points_info(uid_s)
+            full_msg = f"🤖 ИИ-тьютор:\n\n{explanation}\n\n---\n{pts_info} (+20 баллов! 🎉)"
+            send_message(uid, full_msg, ai_keyboard())
+            return
+
+    send_message(uid, "Нажми на кнопку в меню — я всё покажу! 👇", main_keyboard())
+
+
+# ─── ЗАПУСК ───
+vk_session = vk_api.VkApi(token=TOKEN)
+vk = vk_session.get_api()
+vk_rem_session = vk_api.VkApi(token=TOKEN)
+vk_rem = vk_rem_session.get_api()
+
+longpoll = VkLongPoll(vk_session)
+
+threading.Thread(target=reminder_loop, daemon=True).start()
+
+print("=" * 50)
+print("  Навигатор Успеха v3.0")
+print("  ИИ-тьютор + аналитика + геймификация")
+print("  Бот запущен! ✅")
+print("=" * 50)
+
+for event in longpoll.listen():
+    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+        handle_message(event)
