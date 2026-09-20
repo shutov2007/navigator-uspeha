@@ -1,1533 +1,2445 @@
 # -*- coding: utf-8 -*-
 """
-Навигатор успеха — чат-бот для ВКонтакте
-Команда «Адреналин», конкурс «Технологии Первых»
-Возрастная группа: 11-12 лет
+================================================================================
+    НАВИГАТОР УСПЕХА — VK-бот с интеграцией GigaChat
+    Версия: 2.0.0
+    Автор: LifeCode Studio
+================================================================================
 
-Возможности:
-  - Расписание уроков (кнопочный ввод: день → время → предмет)
-  - Кружки и секции (кнопочный ввод: день → время → название)
-  - ИИ-тьютор на базе GigaChat (Сбер)
-  - Управление ДЗ с умными напоминаниями
-  - Пользовательские напоминания
-  - Геймификация (XP, уровни, стрик)
-  - Утренние/вечерние мотивационные рассылки
-  - Анализ нагрузки дня
-  - Поделиться расписанием с другом
-  - Ссылки на образовательные ресурсы РФ
+    Полнофункциональный бот для ВКонтакте, который:
+      - Регистрирует и ведёт пользователей
+      - Хранит историю диалогов в PostgreSQL
+      - Интегрируется с GigaChat для генерации ответов
+      - Поддерживает админ-команды и статистику
+      - Имеет защиту от спама и систему логирования
+      - Обрабатывает ошибки на всех уровнях
+      - Поддерживает Long Polling для получения сообщений
+
+    Файл: navigator_bot.py
+    Требования: Python 3.10+, PostgreSQL 14+, VK API, GigaChat API
+================================================================================
 """
 
 import os
+import sys
+import time
 import json
-import hashlib
 import logging
+import logging.handlers
+import traceback
+import signal
 import threading
+import queue
+import hashlib
+import re
+import datetime
 import random
-from datetime import datetime, timedelta, date
-from typing import Optional, List, Dict, Any
+import socket
+from typing import Optional, Dict, List, Any, Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
 
-import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import requests
-from dotenv import load_dotenv
+# --- Внешние библиотеки ---
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    print("КРИТИЧНО: библиотека python-dotenv не установлена!")
+    print("Выполните: pip install python-dotenv")
+    sys.exit(1)
 
-load_dotenv()
+try:
+    import psycopg2
+    from psycopg2 import pool, errors as pg_errors, sql
+    from psycopg2.extras import RealDictCursor, Json
+except ImportError:
+    print("КРИТИЧНО: библиотека psycopg2 не установлена!")
+    print("Выполните: pip install psycopg2-binary")
+    sys.exit(1)
 
-# ============================================================
-#  КОНФИГУРАЦИЯ
-# ============================================================
+try:
+    import vk_api
+    from vk_api.exceptions import ApiError, VkApiError
+except ImportError:
+    print("КРИТИЧНО: библиотека vk_api не установлена!")
+    print("Выполните: pip install vk_api")
+    sys.exit(1)
 
-VK_TOKEN = os.getenv("VK_TOKEN", "ТВОЙ_VK_TOKEN")
-GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID", "ТВОЙ_CLIENT_ID")
-GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET", "ТВОЙ_CLIENT_SECRET")
-GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+try:
+    import requests
+except ImportError:
+    print("КРИТИЧНО: библиотека requests не установлена!")
+    print("Выполните: pip install requests")
+    sys.exit(1)
 
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "dbname": os.getenv("DB_NAME", "navigator"),
-    "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", "ТВОЙ_ПАРОЛЬ"),
-    "port": os.getenv("DB_PORT", "5432"),
-}
 
-REMINDER_HOUR = 19          # час напоминания о ДЗ (накануне дедлайна)
-REMINDER_CHECK_MIN = 5       # как часто проверять напоминания (в минутах)
-MORNING_HOUR = 7             # час утреннего сообщения
-EVENING_HOUR = 21            # час вечернего сообщения
-XP_PER_LEVEL = 100           # сколько XP нужно для нового уровня
+# =============================================================================
+# КОНСТАНТЫ И КОНФИГУРАЦИЯ
+# =============================================================================
 
-LESSON_TIMES = [
-    "08:30", "09:30", "10:25", "11:30",
-    "12:35", "13:35", "14:30", "15:20", "16:05"
-]
+BOT_NAME = "Навигатор Успеха"
+BOT_VERSION = "2.0.0"
+BOT_AUTHOR = "LifeCode Studio"
 
-CLUB_TIMES = [
-    "15:00", "15:30", "16:00", "16:30",
-    "17:00", "17:30", "18:00", "18:30", "19:00", "19:30"
-]
+# Параметры БД
+DB_MIN_CONNECTIONS = 2
+DB_MAX_CONNECTIONS = 10
+DB_CONNECTION_TIMEOUT = 10  # секунд
 
-DAYS = {
-    1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб", 7: "Вс"
-}
+# Параметры VK Long Polling
+VK_LONG_POLL_WAIT = 25  # секунд ожидания сервера
+VK_LONG_POLL_MODE = 234  # режим получения событий (сообщения + расширения)
+VK_LONG_POLL_VERSION = 3
+VK_API_VERSION = "5.199"
 
-SUBJECTS = [
-    "Математика", "Русский язык", "Литература", "Английский",
-    "История", "Обществознание", "География", "Биология",
-    "Физика", "Химия", "Информатика", "Технология",
-    "Физкультура", "Музыка", "ИЗО", "ОБЖ",
-    "Разговоры о важном", "Мои горизонты"
-]
-SPECIAL_SUBJECTS = {"Разговоры о важном", "Мои горизонты"}
+# Параметры GigaChat
+GIGACHAT_API_URL = "https://gigachat.devicespace.ru/gigachat/v1"
+GIGACHAT_AUTH_URL = "https://gigachat.devicespace.ru/gigachat/api/v5"
+GIGACHAT_TIMEOUT = 60  # секунд на ответ
+GIGACHAT_MAX_RETRIES = 3
+GIGACHAT_RETRY_DELAY = 2  # секунд между попытками
+GIGACHAT_MODEL = "GigaChat-Pro"
 
-STUDY_LINKS = {
-    "ЦОК": "https://m.edsoo.ru",
-    "Учи.ру": "https://uchi.ru",
-    "Яндекс.Учебник": "https://education.yandex.ru",
-    "Stepik": "https://stepik.org",
-    "Skysmart": "https://skysmart.ru",
-    "ФИПИ": "https://fipi.ru",
-    "РЭШ": "https://resh.edu.ru",
-}
+# Параметры бота
+MAX_MESSAGE_LENGTH = 4096  # максимум символов в одном сообщении VK
+MAX_HISTORY_MESSAGES = 20  # сколько сообщений истории отправлять в GigaChat
+ADMIN_COMMAND_PREFIX = "!"
+ANTISPAM_WINDOW = 10  # секунд — окно для подсчёта сообщений от одного юзера
+ANTISPAM_MAX_MESSAGES = 5  # максимум сообщений в окне
+ANTISPAM_BAN_DURATION = 300  # секунд — на сколько банить за спам
+MAX_RETRIES_VK = 3  # попыток отправки сообщения
+VK_SEND_DELAY = 0.05  # задержка между отправкой (для лимитов API)
+HEALTH_CHECK_INTERVAL = 300  # секунд между проверками здоровья (5 минут)
+STATS_DUMP_INTERVAL = 3600  # секунд между дампом статистики (1 час)
 
-MORNING_PHRASES = [
-    "Сегодня отличный день, чтобы сделать чуть больше, чем вчера! 💪",
-    "Ты справишься со всем, что запланировано — шаг за шагом. ✨",
-    "Помни: даже маленькие шаги ведут к большим победам! 🚀",
-    "Новый день — новые возможности. Поехали! 🌟",
-    "Ты умнее и сильнее, чем думаешь. Верю в тебя! 🌈",
-]
-
-EVENING_PHRASES = [
-    "Ты сегодня молодец — пора отдохнуть и набраться сил! 🌙",
-    "День был насыщенным, ты справился. Завтра будет новый шанс. ✨",
-    "Спокойной ночи! Пусть завтра всё получится ещё лучше. 💤",
-    "Гордись тем, что сделал сегодня. А завтра — новый день! 🌟",
-    "Отдыхай с чистой совестью — ты заслужил! 🌙",
-]
-
-ANTI_STRESS_PHRASES = [
-    "Вижу, день плотный. Помни: можно сделать только самое важное, остальное — завтра. 😊",
-    "Сегодня много уроков, но ты обязательно справишься. Дыши глубоко! 🧘",
-    "Нагрузка высокая — не забывай делать паузы между делами. 💙",
-]
-
-BADGES = {
-    "Планер дня": "Выполнил все ДЗ за день",
-    "Супер-организатор": "Выполнил 3 ДЗ подряд без просрочки",
-    "Стрик-мастер": "7 дней подряд без пропусков",
-    "Знаток": "Правильно ответил на 5 вопросов ИИ-тьютора",
-    "Новичок": "Зарегистрировался в боте",
-    "Знаток": "Достиг 2 уровня",
-}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+# Системный промпт для GigaChat
+SYSTEM_PROMPT = (
+    "Ты — Навигатор Успеха, виртуальный помощник для предпринимателей и "
+    "саморазвития. Твоя задача — помогать людям находить путь к успеху, "
+    "давать мотивирующие советы, помогать с бизнес-идеями, планированием "
+    "и саморазвитием. Отвечай на русском языке, будь дружелюбным, "
+    "кратким, но информативным. Используй эмодзи умеренно. "
+    "Если не знаешь ответ — честно скажи об этом. "
+    "Не давай финансовых гарантий и медицинских советов."
 )
 
-# ============================================================
-#  БАЗА ДАННЫХ
-# ============================================================
-
-def get_db_conn():
-    return psycopg2.connect(**DB_CONFIG)
-
-def init_db():
-    """Создаёт все таблицы, если их ещё нет."""
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    vk_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    class_grade INT CHECK (class_grade BETWEEN 5 AND 9),
-                    timezone TEXT DEFAULT 'Europe/Moscow',
-                    level INT DEFAULT 1,
-                    xp INT DEFAULT 0,
-                    streak_days INT DEFAULT 0,
-                    last_streak_date DATE,
-                    last_active TIMESTAMP,
-                    correct_ai_answers INT DEFAULT 0,
-                    state TEXT DEFAULT 'main',
-                    state_data TEXT
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_schedule (
-                    id SERIAL PRIMARY KEY,
-                    vk_id BIGINT REFERENCES users(vk_id) ON DELETE CASCADE,
-                    day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 1 AND 7),
-                    subject TEXT NOT NULL,
-                    start_time TIME NOT NULL,
-                    is_special BOOLEAN DEFAULT FALSE,
-                    UNIQUE(vk_id, day_of_week, start_time)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS extracurriculars (
-                    id SERIAL PRIMARY KEY,
-                    vk_id BIGINT REFERENCES users(vk_id) ON DELETE CASCADE,
-                    name TEXT NOT NULL,
-                    day_of_week INT NOT NULL CHECK (day_of_week BETWEEN 1 AND 7),
-                    start_time TIME NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS homework (
-                    id SERIAL PRIMARY KEY,
-                    vk_id BIGINT REFERENCES users(vk_id) ON DELETE CASCADE,
-                    subject TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    due_date DATE NOT NULL,
-                    is_done BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS reminders (
-                    id SERIAL PRIMARY KEY,
-                    vk_id BIGINT REFERENCES users(vk_id) ON DELETE CASCADE,
-                    text TEXT NOT NULL,
-                    trigger_time TIMESTAMP NOT NULL,
-                    is_active BOOLEAN DEFAULT TRUE
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS gigachat_cache (
-                    topic_hash TEXT PRIMARY KEY,
-                    response_json TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS hw_reminders_sent (
-                    hw_id INT REFERENCES homework(id) ON DELETE CASCADE,
-                    sent_date DATE NOT NULL,
-                    PRIMARY KEY (hw_id, sent_date)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS quiz_sessions (
-                    vk_id BIGINT PRIMARY KEY,
-                    correct_answer TEXT,
-                    topic TEXT,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-        conn.commit()
-    logging.info("База данных инициализирована.")
-
-# --- Пользователи ---
-
-def get_user(vk_id: int) -> Optional[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users WHERE vk_id = %s", (vk_id,))
-            return cur.fetchone()
-
-def create_user(vk_id: int, username: str) -> Dict:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "INSERT INTO users (vk_id, username, state) VALUES (%s, %s, 'main') RETURNING *",
-                (vk_id, username)
-            )
-            conn.commit()
-            return cur.fetchone()
-
-def set_class(vk_id: int, class_grade: int):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET class_grade = %s WHERE vk_id = %s", (class_grade, vk_id))
-            conn.commit()
-
-def set_state(vk_id: int, state: str, state_data: str = None):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET state = %s, state_data = %s WHERE vk_id = %s",
-                (state, state_data, vk_id)
-            )
-            conn.commit()
-
-def update_last_active(vk_id: int):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET last_active = NOW() WHERE vk_id = %s", (vk_id,))
-            conn.commit()
-
-# --- Геймификация ---
-
-def give_xp(vk_id: int, amount: int) -> Dict:
-    """Начисляет XP и проверяет повышение уровня. Возвращает {'xp': total, 'level': lvl, 'leveled_up': bool}."""
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT xp, level FROM users WHERE vk_id = %s", (vk_id,))
-            u = cur.fetchone()
-            if not u:
-                return {"xp": 0, "level": 1, "leveled_up": False}
-            new_xp = u["xp"] + amount
-            new_level = new_xp // XP_PER_LEVEL + 1
-            leveled_up = new_level > u["level"]
-            cur.execute(
-                "UPDATE users SET xp = %s, level = %s WHERE vk_id = %s",
-                (new_xp, new_level, vk_id)
-            )
-            conn.commit()
-            return {"xp": new_xp, "level": new_level, "leveled_up": leveled_up}
-
-def update_streak(vk_id: int):
-    today = date.today()
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT last_streak_date, streak_days FROM users WHERE vk_id = %s", (vk_id,))
-            u = cur.fetchone()
-            if not u:
-                return
-            if u["last_streak_date"] is None or u["last_streak_date"] < today:
-                new_streak = (u["streak_days"] + 1) if u["last_streak_date"] == today - timedelta(days=1) else 1
-                cur.execute(
-                    "UPDATE users SET streak_days = %s, last_streak_date = %s WHERE vk_id = %s",
-                    (new_streak, today, vk_id)
-                )
-                conn.commit()
-
-def get_hw_stats(vk_id: int) -> Dict:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            week_ago = date.today() - timedelta(days=7)
-            cur.execute(
-                "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE is_done = TRUE) AS done FROM homework WHERE vk_id = %s AND created_at >= %s",
-                (vk_id, week_ago)
-            )
-            row = cur.fetchone()
-            total = row["total"] if row else 0
-            done = row["done"] if row else 0
-            pct = round(done / total * 100) if total > 0 else 0
-            return {"total": total, "done": done, "pct": pct}
-
-# --- Расписание (уроки) ---
-
-def add_lesson(vk_id: int, day: int, subject: str, start_time: str):
-    is_special = subject in SPECIAL_SUBJECTS
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO user_schedule (vk_id, day_of_week, subject, start_time, is_special) VALUES (%s, %s, %s, %s, %s)",
-                (vk_id, day, subject, start_time, is_special)
-            )
-            conn.commit()
-
-def get_user_schedule(vk_id: int, day_of_week: Optional[int] = None) -> List[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if day_of_week is not None:
-                cur.execute(
-                    "SELECT * FROM user_schedule WHERE vk_id = %s AND day_of_week = %s ORDER BY start_time",
-                    (vk_id, day_of_week)
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM user_schedule WHERE vk_id = %s ORDER BY day_of_week, start_time",
-                    (vk_id,)
-                )
-            return cur.fetchall()
-
-def delete_lesson(vk_id: int, lesson_id: int) -> bool:
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM user_schedule WHERE vk_id = %s AND id = %s", (vk_id, lesson_id))
-            deleted = cur.rowcount > 0
-            conn.commit()
-            return deleted
-
-# --- Кружки ---
-
-def add_club(vk_id: int, name: str, day: int, start_time: str):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO extracurriculars (vk_id, name, day_of_week, start_time) VALUES (%s, %s, %s, %s)",
-                (vk_id, name, day, start_time)
-            )
-            conn.commit()
-
-def get_user_clubs(vk_id: int, day_of_week: Optional[int] = None) -> List[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if day_of_week is not None:
-                cur.execute(
-                    "SELECT * FROM extracurriculars WHERE vk_id = %s AND day_of_week = %s ORDER BY start_time",
-                    (vk_id, day_of_week)
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM extracurriculars WHERE vk_id = %s ORDER BY day_of_week, start_time",
-                    (vk_id,)
-                )
-            return cur.fetchall()
-
-def delete_club(vk_id: int, club_id: int) -> bool:
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM extracurriculars WHERE vk_id = %s AND id = %s", (vk_id, club_id))
-            deleted = cur.rowcount > 0
-            conn.commit()
-            return deleted
-
-# --- ДЗ ---
-
-def add_homework(vk_id: int, subject: str, description: str, due_date: str):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO homework (vk_id, subject, description, due_date) VALUES (%s, %s, %s, %s)",
-                (vk_id, subject, description, due_date)
-            )
-            conn.commit()
-
-def get_pending_hw(vk_id: int) -> List[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM homework WHERE vk_id = %s AND is_done = FALSE ORDER BY due_date",
-                (vk_id,)
-            )
-            return cur.fetchall()
-
-def mark_hw_done(vk_id: int, hw_id: int) -> bool:
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE homework SET is_done = TRUE WHERE vk_id = %s AND id = %s AND is_done = FALSE",
-                (vk_id, hw_id)
-            )
-            updated = cur.rowcount > 0
-            conn.commit()
-            return updated
-
-def get_hw_for_reminder(tomorrow: date) -> List[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT h.*, u.username, u.vk_id AS user_vk_id FROM homework h
-                JOIN users u ON h.vk_id = u.vk_id
-                WHERE h.is_done = FALSE AND h.due_date = %s
-            """, (tomorrow,))
-            return cur.fetchall()
-
-def is_hw_reminder_sent(hw_id: int, sent_date: date) -> bool:
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM hw_reminders_sent WHERE hw_id = %s AND sent_date = %s",
-                (hw_id, sent_date)
-            )
-            return cur.fetchone() is not None
-
-def mark_hw_reminder_sent(hw_id: int, sent_date: date):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO hw_reminders_sent (hw_id, sent_date) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                (hw_id, sent_date)
-            )
-            conn.commit()
-
-# --- Напоминания ---
-
-def add_reminder(vk_id: int, text: str, trigger_time: datetime):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO reminders (vk_id, text, trigger_time) VALUES (%s, %s, %s)",
-                (vk_id, text, trigger_time)
-            )
-            conn.commit()
-
-def get_due_reminders(now: datetime) -> List[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM reminders WHERE trigger_time <= %s AND is_active = TRUE",
-                (now,)
-            )
-            return cur.fetchall()
-
-def deactivate_reminder(reminder_id: int):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE reminders SET is_active = FALSE WHERE id = %s", (reminder_id,))
-            conn.commit()
-
-def get_active_reminders(vk_id: int) -> List[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM reminders WHERE vk_id = %s AND is_active = TRUE ORDER BY trigger_time",
-                (vk_id,)
-            )
-            return cur.fetchall()
-
-def get_today_reminders(vk_id: int) -> List[Dict]:
-    today = date.today()
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM reminders WHERE vk_id = %s AND is_active = TRUE AND trigger_time::date = %s ORDER BY trigger_time",
-                (vk_id, today)
-            )
-            return cur.fetchall()
-
-def delete_reminder(vk_id: int, reminder_id: int) -> bool:
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM reminders WHERE vk_id = %s AND id = %s", (vk_id, reminder_id))
-            deleted = cur.rowcount > 0
-            conn.commit()
-            return deleted
-
-def toggle_reminder(vk_id: int, reminder_id: int) -> Optional[bool]:
-    """Переключает активность напоминания. Возвращает новое состояние или None."""
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT is_active FROM reminders WHERE vk_id = %s AND id = %s", (vk_id, reminder_id))
-            row = cur.fetchone()
-            if not row:
-                return None
-            new_state = not row["is_active"]
-            cur.execute("UPDATE reminders SET is_active = %s WHERE id = %s", (new_state, reminder_id))
-            conn.commit()
-            return new_state
-
-# --- Quiz sessions (для ИИ-тьютора) ---
-
-def save_quiz_session(vk_id: int, correct_answer: str, topic: str):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO quiz_sessions (vk_id, correct_answer, topic) VALUES (%s, %s, %s) "
-                "ON CONFLICT (vk_id) DO UPDATE SET correct_answer = EXCLUDED.correct_answer, topic = EXCLUDED.topic, created_at = NOW()",
-                (vk_id, correct_answer, topic)
-            )
-            conn.commit()
-
-def get_quiz_session(vk_id: int) -> Optional[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM quiz_sessions WHERE vk_id = %s", (vk_id,))
-            return cur.fetchone()
-
-def clear_quiz_session(vk_id: int):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM quiz_sessions WHERE vk_id = %s", (vk_id,))
-            conn.commit()
-
-# ============================================================
-#  GIGACHAT (Сбер)
-# ============================================================
-
-def get_gigachat_token() -> Optional[str]:
-    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-        "RqUID": hashlib.uuid4().hex,
-    }
-    data = {
-        "scope": GIGACHAT_SCOPE,
-    }
-    # GigaChat использует Basic auth с client_id:client_secret
-    import base64
-    auth_str = f"{GIGACHAT_CLIENT_ID}:{GIGACHAT_CLIENT_SECRET}"
-    auth_b64 = base64.b64encode(auth_str.encode()).decode()
-    headers["Authorization"] = f"Basic {auth_b64}"
-
-    try:
-        resp = requests.post(url, headers=headers, data=data, verify=False, timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("access_token")
-    except Exception as e:
-        logging.error(f"GigaChat auth error: {e}")
-        return None
-
-def hash_topic(topic: str, class_grade: int) -> str:
-    return hashlib.sha256(f"{topic}:{class_grade}".encode()).hexdigest()
-
-def get_cached_gigachat(topic_hash: str) -> Optional[Dict]:
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT response_json FROM gigachat_cache WHERE topic_hash = %s", (topic_hash,))
-            row = cur.fetchone()
-            if row:
-                return json.loads(row["response_json"])
-    return None
-
-def cache_gigachat(topic_hash: str, response: Dict):
-    with get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO gigachat_cache (topic_hash, response_json) VALUES (%s, %s) "
-                "ON CONFLICT (topic_hash) DO UPDATE SET response_json = EXCLUDED.response_json",
-                (topic_hash, json.dumps(response, ensure_ascii=False))
-            )
-            conn.commit()
-
-def call_gigachat(topic: str, class_grade: int) -> Optional[Dict]:
-    topic_hash = hash_topic(topic, class_grade)
-
-    # Проверяем кэш
-    cached = get_cached_gigachat(topic_hash)
-    if cached:
-        logging.info(f"GigaChat: ответ из кэша для темы '{topic}'")
-        return cached
-
-    token = get_gigachat_token()
-    if not token:
-        return None
-
-    prompt = (
-        f"Объясни тему \"{topic}\" для ученика {class_grade} класса простым и понятным языком, "
-        "как будто ты добрый школьный учитель. Используй 2-3 примера из жизни (еда, игры, спорт, магазин). "
-        "Текст объяснения должен быть не очень длинным — 4-6 абзацев. "
-        "После объяснения задай 1 проверочный вопрос с 3 вариантами ответа (А, Б, В). "
-        "Ответ верни СТРОГО в формате JSON:\n"
-        '{"explanation": "текст объяснения", '
-        '"question": "текст вопроса", '
-        '"options": {"А": "вариант А", "Б": "вариант Б", "В": "вариант В"}, '
-        '"correct": "А"}'
-    )
-
-    url = "https://gigachat.devices.sberbank.ru/api/v2/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    payload = {
-        "model": "GigaChat",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7,
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=45)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        # Очистка от markdown-обёртки
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1] if "\n" in content else content
-        if content.endswith("```"):
-            content = content.rsplit("```", 1)[0]
-        content = content.strip()
-        data = json.loads(content)
-        cache_gigachat(topic_hash, data)
-        logging.info(f"GigaChat: новый ответ для темы '{topic}' сохранён в кэш")
-        return data
-    except Exception as e:
-        logging.error(f"GigaChat call error: {e}")
-        return None
-
-# ============================================================
-#  VK КЛАВИАТУРЫ
-# ============================================================
-
-def kb_main_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("📅 Что сегодня?", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("📚 ИИ-тьютор", color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button("🎒 ДЗ", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("🔔 Напоминания", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("📊 Прогресс", color=VkKeyboardColor.SECONDARY)
-    kb.add_button("🔗 Учёба", color=VkKeyboardColor.SECONDARY)
-    kb.add_line()
-    kb.add_button("📋 Расписание", color=VkKeyboardColor.SECONDARY)
-    kb.add_button("🎯 Кружки", color=VkKeyboardColor.SECONDARY)
-    kb.add_line()
-    kb.add_button("🤝 Поделиться", color=VkKeyboardColor.SECONDARY)
-    return kb
-
-def kb_back():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("🔙 Назад", color=VkKeyboardColor.NEGATIVE)
-    return kb
-
-def kb_back_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("🔙 Назад", color=VkKeyboardColor.NEGATIVE)
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.PRIMARY)
-    return kb
-
-def kb_days():
-    kb = VkKeyboard(one_time=False)
-    for day_num in [1, 2, 3, 4, 5]:
-        kb.add_button(f"day_{day_num}", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("day_6", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("day_7", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("🔙 Назад", color=VkKeyboardColor.NEGATIVE)
-    return kb
-
-def kb_lesson_times():
-    kb = VkKeyboard(one_time=False)
-    for i, t in enumerate(LESSON_TIMES):
-        kb.add_button(f"time_{t}", color=VkKeyboardColor.PRIMARY)
-        if i % 3 == 2:
-            kb.add_line()
-    kb.add_line()
-    kb.add_button("🔙 Назад", color=VkKeyboardColor.NEGATIVE)
-    return kb
-
-def kb_club_times():
-    kb = VkKeyboard(one_time=False)
-    for i, t in enumerate(CLUB_TIMES):
-        kb.add_button(f"ctime_{t}", color=VkKeyboardColor.PRIMARY)
-        if i % 3 == 2:
-            kb.add_line()
-    kb.add_line()
-    kb.add_button("🔙 Назад", color=VkKeyboardColor.NEGATIVE)
-    return kb
-
-def kb_subjects():
-    kb = VkKeyboard(one_time=False)
-    for i, s in enumerate(SUBJECTS):
-        color = VkKeyboardColor.POSITIVE if s in SPECIAL_SUBJECTS else VkKeyboardColor.SECONDARY
-        kb.add_button(f"subj_{s}", color=color)
-        if i % 2 == 1:
-            kb.add_line()
-    kb.add_line()
-    kb.add_button("🔙 Назад", color=VkKeyboardColor.NEGATIVE)
-    return kb
-
-def kb_schedule_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("➕ Добавить урок", color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button("📋 Моё расписание", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("❌ Удалить урок", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.PRIMARY)
-    return kb
-
-def kb_clubs_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("➕ Добавить кружок", color=VkKeyboardColor.POSITIVE)
-    kb.add_line()
-    kb.add_button("📋 Мои кружки", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("❌ Удалить кружок", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.PRIMARY)
-    return kb
-
-def kb_hw_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("➕ Добавить ДЗ", color=VkKeyboardColor.POSITIVE)
-    kb.add_button("📋 Мои ДЗ", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.PRIMARY)
-    return kb
-
-def kb_reminders_menu():
-    kb = VkKeyboard(one_time=False)
-    kb.add_button("➕ Добавить", color=VkKeyboardColor.POSITIVE)
-    kb.add_button("📋 Сегодня", color=VkKeyboardColor.PRIMARY)
-    kb.add_line()
-    kb.add_button("📋 Все", color=VkKeyboardColor.PRIMARY)
-    kb.add_button("❌ Удалить", color=VkKeyboardColor.NEGATIVE)
-    kb.add_line()
-    kb.add_button("🔄 Вкл/Выкл", color=VkKeyboardColor.SECONDARY)
-    kb.add_line()
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.PRIMARY)
-    return kb
-
-def kb_quiz_options(options: Dict[str, str]):
-    kb = VkKeyboard(one_time=True)
-    for key in sorted(options.keys()):
-        kb.add_button(f"quiz_{key}", color=VkKeyboardColor.PRIMARY)
-        kb.add_line()
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.SECONDARY)
-    return kb
-
-def kb_study_links():
-    kb = VkKeyboard(one_time=False)
-    for name, url in STUDY_LINKS.items():
-        kb.add_openlink_button(label=name, link=url)
-        kb.add_line()
-    kb.add_button("🏠 Меню", color=VkKeyboardColor.PRIMARY)
-    return kb
-
-# ============================================================
-#  ОТПРАВКА СООБЩЕНИЙ
-# ============================================================
-
-_vk_session = None
-
-def get_vk_api():
-    global _vk_session
-    if _vk_session is None:
-        _vk_session = vk_api.VkApi(token=VK_TOKEN)
-    return _vk_session.get_api()
-
-def send_msg(vk_id: int, text: str, keyboard: VkKeyboard = None):
-    vk = get_vk_api()
-    try:
-        vk.messages.send(
-            peer_id=vk_id,
-            message=text,
-            keyboard=keyboard.get_keyboard() if keyboard else None,
-            random_id=random.randint(0, 2**31)
-        )
-    except Exception as e:
-        logging.error(f"Send message failed: {e}")
-
-def send_typing(vk_id: int):
-    vk = get_vk_api()
-    try:
-        vk.messages.setActivity(peer_id=vk_id, type="typing")
-    except:
-        pass
-
-# ============================================================
-#  ФОРМИРОВАНИЕ ТЕКСТОВ
-# ============================================================
-
-def format_load_emoji(load: int) -> str:
-    if load <= 3:
-        return "😴😴😴" + " ⬜" * 7
-    elif load <= 6:
-        return "😐😐😐😐😐😐" + " ⬜" * 4
-    else:
-        return "😵" * min(load, 10)
-
-def format_schedule_text(lessons: List[Dict], clubs: List[Dict]) -> str:
-    text = ""
-    if lessons:
-        text += "📚 Уроки:\n"
-        for l in lessons:
-            special = " 🟢" if l["is_special"] else ""
-            t = l["start_time"].strftime("%H:%M") if hasattr(l["start_time"], "strftime") else str(l["start_time"])
-            text += f"  ⏰ {t} — {l['subject']}{special}\n"
-    else:
-        text += "📚 Уроков нет\n"
-    if clubs:
-        text += "\n🎯 Кружки:\n"
-        for c in clubs:
-            t = c["start_time"].strftime("%H:%M") if hasattr(c["start_time"], "strftime") else str(c["start_time"])
-            text += f"  ⏰ {t} — {c['name']}\n"
-    return text if text else "Сегодня свободный день! 🎉"
-
-def format_full_schedule(vk_id: int) -> str:
-    text = "📋 Расписание на неделю:\n\n"
-    for day_num in range(1, 8):
-        lessons = get_user_schedule(vk_id, day_num)
-        clubs = get_user_clubs(vk_id, day_num)
-        if not lessons and not clubs:
-            continue
-        text += f"📅 {DAYS[day_num]}:\n"
-        for l in lessons:
-            t = l["start_time"].strftime("%H:%M") if hasattr(l["start_time"], "strftime") else str(l["start_time"])
-            special = " 🟢" if l["is_special"] else ""
-            text += f"  ⏰ {t} — {l['subject']}{special}\n"
-        for c in clubs:
-            t = c["start_time"].strftime("%H:%M") if hasattr(c["start_time"], "strftime") else str(c["start_time"])
-            text += f"  🎯 {t} — {c['name']}\n"
-        text += "\n"
-    if text == "📋 Расписание на неделю:\n\n":
-        text = "Твоё расписание пока пустое. Добавь уроки в разделе «📋 Расписание»! 📝"
-    return text
-
-def format_full_clubs(vk_id: int) -> str:
-    clubs = get_user_clubs(vk_id)
-    if not clubs:
-        return "У тебя пока нет кружков. Добавь в разделе «🎯 Кружки»! 🎯"
-    text = "🎯 Твои кружки:\n\n"
-    for c in clubs:
-        t = c["start_time"].strftime("%H:%M") if hasattr(c["start_time"], "strftime") else str(c["start_time"])
-        text += f"🆔 {c['id']} | {DAYS[c['day_of_week']]} {t} — {c['name']}\n"
-    return text
-
-def format_progress(vk_id: int) -> str:
-    u = get_user(vk_id)
-    stats = get_hw_stats(vk_id)
-    xp_in_level = u["xp"] % XP_PER_LEVEL
-    text = (
-        f"📊 Твой прогресс:\n\n"
-        f"🏆 Уровень: {u['level']}\n"
-        f"⭐ XP: {u['xp']} (до следующего уровня: {XP_PER_LEVEL - xp_in_level})\n"
-        f"🔥 Стрик: {u['streak_days']} дн. подряд\n"
-        f"✅ ДЗ за неделю: {stats['done']}/{stats['total']} ({stats['pct']}%)\n"
-        f"🧠 Правильных ответов ИИ-тьютора: {u.get('correct_ai_answers', 0)}\n"
-    )
-    if u["level"] >= 2:
-        text += f"\n🏅 Значок: «Знаток» (2 уровень)"
-    if u["streak_days"] >= 7:
-        text += f"\n🏅 Значок: «Стрик-мастер» (7 дней подряд)"
-    return text
-
-# ============================================================
-#  ФОНОВЫЕ ЗАДАЧИ (APScheduler)
-# ============================================================
-
-scheduler = BlockingScheduler()
-
-def morning_motivation():
-    logging.info("Запуск утренней рассылки...")
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users WHERE class_grade IS NOT NULL")
-            users = cur.fetchall()
-    for u in users:
-        try:
-            today = datetime.now().weekday() + 1
-            lessons = get_user_schedule(u["vk_id"], today)
-            clubs = get_user_clubs(u["vk_id"], today)
-            load = len(lessons) + len(clubs)
-            name = u["username"] or "друг"
-            motivation = random.choice(MORNING_PHRASES)
-            text = (
-                f"Доброе утро, {name}! 🌞\n\n"
-                f"Сегодня у тебя {len(lessons)} уроков и {len(clubs)} кружков.\n"
-                f"Нагрузка: {format_load_emoji(load)}\n\n"
-            )
-            if load >= 7:
-                text += random.choice(ANTI_STRESS_PHRASES) + "\n\n"
-            text += f"{motivation}\n\n"
-            text += "План на день — в разделе «📅 Что сегодня?». Удачи! 🍀"
-            send_msg(u["vk_id"], text)
-        except Exception as e:
-            logging.error(f"Morning message failed for {u['vk_id']}: {e}")
-
-def evening_motivation():
-    logging.info("Запуск вечерней рассылки...")
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users WHERE class_grade IS NOT NULL")
-            users = cur.fetchall()
-    for u in users:
-        try:
-            pending = get_pending_hw(u["vk_id"])
-            name = u["username"] or "друг"
-            motivation = random.choice(EVENING_PHRASES)
-            text = (
-                f"Спокойной ночи, {name}! 🌙\n\n"
-                f"У тебя осталось {len(pending)} невыполненных ДЗ. "
-            )
-            if pending:
-                text += "Не переживай — завтра разберёшься! 💪\n\n"
-            else:
-                text += "Ты всё сделал — красавчик! 🌟\n\n"
-            text += f"{motivation}\n\nЯ буду здесь утром. До встречи! 👋"
-            send_msg(u["vk_id"], text)
-        except Exception as e:
-            logging.error(f"Evening message failed for {u['vk_id']}: {e}")
-
-def check_reminders_and_hw():
-    now = datetime.now()
-    with get_db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Пользовательские напоминания
-            cur.execute("SELECT * FROM reminders WHERE trigger_time <= %s AND is_active = TRUE", (now,))
-            reminders = cur.fetchall()
-    for r in reminders:
-        try:
-            send_msg(r["vk_id"], f"⏰ Напоминание: {r['text']}")
-            deactivate_reminder(r["id"])
-        except Exception as e:
-            logging.error(f"Reminder send failed: {e}")
-
-    # Умные напоминания о ДЗ — каждый час после REMINDER_HOUR
-    if now.hour >= REMINDER_HOUR:
-        tomorrow = now.date() + timedelta(days=1)
-        hw_list = get_hw_for_reminder(tomorrow)
-        for hw in hw_list:
-            if is_hw_reminder_sent(hw["id"], now.date()):
-                continue
+# Приветственное сообщение
+WELCOME_MESSAGE = (
+    "🌟 Добро пожаловать в «Навигатор Успеха»!\n\n"
+    "Я — твой виртуальный помощник на пути к целям. "
+    "Задавай любые вопросы о бизнесе, саморазвитии, "
+    "мотивации — и я постараюсь помочь!\n\n"
+    "Команды:\n"
+    "  !help — список команд\n"
+    "  !stats — твоя статистика\n"
+    "  !clear — очистить историю диалога\n"
+    "  !about — информация о боте\n\n"
+    "🚀 Поехали!"
+)
+
+HELP_MESSAGE = (
+    "📖 Справка по командам:\n\n"
+    "!help — эта справка\n"
+    "!stats — твоя личная статистика\n"
+    "!clear — очистить историю диалога\n"
+    "!about — информация о боте\n"
+    "!top — топ активных пользователей (для всех)\n\n"
+    "Просто напиши сообщение — и я отвечу!"
+)
+
+ABOUT_MESSAGE = (
+    f"ℹ️ {BOT_NAME} v{BOT_VERSION}\n\n"
+    f"Разработчик: {BOT_AUTHOR}\n"
+    "Технологии: Python, PostgreSQL, VK API, GigaChat\n"
+    "Бот создан для помощи в саморазвитии и бизнесе.\n\n"
+    "Спасибо, что выбрали нас! 🙏"
+)
+
+
+# =============================================================================
+# ПЕРЕЧИСЛЕНИЯ
+# =============================================================================
+
+class UserRole(Enum):
+    """Роли пользователей в системе."""
+    USER = "user"
+    ADMIN = "admin"
+    BANNED = "banned"
+
+
+class UserStatus(Enum):
+    """Статус пользователя."""
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    BANNED = "banned"
+
+
+class MessageType(Enum):
+    """Типы сообщений в истории."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+
+
+class BotState(Enum):
+    """Состояния бота."""
+    STOPPED = auto()
+    STARTING = auto()
+    RUNNING = auto()
+    STOPPING = auto()
+    ERROR = auto()
+
+
+class LogLevel(Enum):
+    """Уровни логирования."""
+    DEBUG = logging.DEBUG
+    INFO = logging.INFO
+    WARNING = logging.WARNING
+    ERROR = logging.ERROR
+    CRITICAL = logging.CRITICAL
+
+
+# =============================================================================
+# КЛАССЫ ДАННЫХ
+# =============================================================================
+
+@dataclass
+class BotConfig:
+    """Конфигурация бота, загружаемая из .env."""
+    # БД
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_name: str = "navigator"
+    db_user: str = "postgres"
+    db_password: str = ""
+    
+    # VK
+    vk_token: str = ""
+    
+    # GigaChat
+    gigachat_client_id: str = ""
+    gigachat_client_secret: str = ""
+    
+    # Админы (список VK ID через запятую в .env)
+    admin_ids: List[int] = field(default_factory=list)
+    
+    # Настройки
+    log_level: str = "INFO"
+    log_file: str = "navigator_bot.log"
+    enable_gigachat: bool = True
+    enable_antispam: bool = True
+    max_history: int = MAX_HISTORY_MESSAGES
+    
+    @classmethod
+    def from_env(cls) -> "BotConfig":
+        """Загружает конфигурацию из .env файла."""
+        load_dotenv()
+        
+        config = cls()
+        
+        # БД
+        config.db_host = os.getenv("DB_HOST", "localhost")
+        config.db_port = int(os.getenv("DB_PORT", "5432"))
+        config.db_name = os.getenv("DB_NAME", "navigator")
+        config.db_user = os.getenv("DB_USER", "postgres")
+        
+        # Пароль — отдельная обработка (проблема с кодировкой)
+        raw_password = os.getenv("DB_PASSWORD", "")
+        if raw_password:
             try:
-                text = (
-                    f"⏰ Внимание!\n\n"
-                    f"Завтра дедлайн по ДЗ:\n"
-                    f"📘 {hw['subject']}\n"
-                    f"📝 {hw['description']}\n"
-                    f"🗓 Срок: {hw['due_date']}\n\n"
-                    f"Не забудь выполнить сегодня вечером! Ты сможешь! 💪"
+                config.db_password = raw_password.encode('utf-8', errors='replace').decode('utf-8')
+            except Exception:
+                config.db_password = str(raw_password)
+        else:
+            config.db_password = ""
+        
+        # VK
+        config.vk_token = os.getenv("VK_TOKEN", "")
+        
+        # GigaChat
+        config.gigachat_client_id = os.getenv("GIGACHAT_CLIENT_ID", "")
+        config.gigachat_client_secret = os.getenv("GIGACHAT_CLIENT_SECRET", "")
+        
+        # Админы
+        admin_ids_str = os.getenv("ADMIN_VK_IDS", "")
+        if admin_ids_str:
+            try:
+                config.admin_ids = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+            except ValueError:
+                config.admin_ids = []
+        
+        # Настройки
+        config.log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+        config.log_file = os.getenv("LOG_FILE", "navigator_bot.log")
+        config.enable_gigachat = os.getenv("ENABLE_GIGACHAT", "true").lower() == "true"
+        config.enable_antispam = os.getenv("ENABLE_ANTISPAM", "true").lower() == "true"
+        
+        try:
+            config.max_history = int(os.getenv("MAX_HISTORY", str(MAX_HISTORY_MESSAGES)))
+        except ValueError:
+            config.max_history = MAX_HISTORY_MESSAGES
+        
+        return config
+    
+    def validate(self) -> List[str]:
+        """Проверяет конфигурацию и возвращает список ошибок."""
+        errors = []
+        
+        if not self.db_host:
+            errors.append("DB_HOST не указан")
+        if not self.db_name:
+            errors.append("DB_NAME не указан")
+        if not self.db_user:
+            errors.append("DB_USER не указан")
+        if not self.db_password:
+            errors.append("DB_PASSWORD не указан")
+        if not self.vk_token:
+            errors.append("VK_TOKEN не указан")
+        if not self.vk_token.startswith("vk"):
+            errors.append("VK_TOKEN выглядит неверно (должен начинаться с 'vk')")
+        if self.enable_gigachat:
+            if not self.gigachat_client_id:
+                errors.append("GIGACHAT_CLIENT_ID не указан, но GigaChat включён")
+            if not self.gigachat_client_secret:
+                errors.append("GIGACHAT_CLIENT_SECRET не указан, но GigaChat включён")
+        
+        return errors
+
+
+@dataclass
+class UserInfo:
+    """Информация о пользователе."""
+    vk_id: int = 0
+    username: str = ""
+    first_name: str = ""
+    last_name: str = ""
+    role: str = UserRole.USER.value
+    status: str = UserStatus.ACTIVE.value
+    messages_count: int = 0
+    first_seen: Optional[datetime.datetime] = None
+    last_seen: Optional[datetime.datetime] = None
+    is_admin: bool = False
+    
+    def full_name(self) -> str:
+        """Возвращает полное имя пользователя."""
+        parts = [p for p in [self.first_name, self.last_name] if p]
+        if parts:
+            return " ".join(parts)
+        return self.username or f"ID:{self.vk_id}"
+
+
+@dataclass
+class MessageHistory:
+    """Элемент истории сообщений."""
+    id: int = 0
+    vk_id: int = 0
+    role: str = ""
+    content: str = ""
+    created_at: Optional[datetime.datetime] = None
+
+
+@dataclass
+class BotStats:
+    """Статистика работы бота."""
+    start_time: Optional[datetime.datetime] = None
+    total_messages_received: int = 0
+    total_messages_sent: int = 0
+    total_users: int = 0
+    total_gigachat_calls: int = 0
+    total_errors: int = 0
+    total_api_retries: int = 0
+    total_spam_blocked: int = 0
+    last_error: str = ""
+    last_error_time: Optional[datetime.datetime] = None
+    
+    def uptime_str(self) -> str:
+        """Возвращает строку времени работы."""
+        if not self.start_time:
+            return "не запущен"
+        delta = datetime.datetime.now() - self.start_time
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours}ч {minutes}м {seconds}с"
+
+
+@dataclass
+class AntispamEntry:
+    """Запись для анти-спам системы."""
+    messages: List[float] = field(default_factory=list)
+    banned_until: float = 0.0
+
+
+# =============================================================================
+# СИСТЕМА ЛОГИРОВАНИЯ
+# =============================================================================
+
+class BotLogger:
+    """Расширенная система логирования с ротацией файлов."""
+    
+    _instance: Optional["BotLogger"] = None
+    _logger: Optional[logging.Logger] = None
+    
+    def __init__(self, log_file: str = "navigator_bot.log", level: str = "INFO"):
+        self._setup_logger(log_file, level)
+    
+    def _setup_logger(self, log_file: str, level: str):
+        """Настраивает логгер с файлом и консолью."""
+        self._logger = logging.getLogger("navigator")
+        self._logger.setLevel(getattr(logging, level, logging.INFO))
+        
+        # Очищаем старые хендлеры
+        self._logger.handlers.clear()
+        
+        # Формат логов
+        formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        
+        # Файловый хендлер с ротацией (5 файлов по 5 МБ)
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
+        self._logger.addHandler(file_handler)
+        
+        # Консольный хендлер
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        self._logger.addHandler(console_handler)
+    
+    @classmethod
+    def get(cls) -> "BotLogger":
+        """Возвращает singleton-экземпляр логгера."""
+        if cls._instance is None:
+            raise RuntimeError("BotLogger не инициализирован! Вызовите setup() сначала.")
+        return cls._instance
+    
+    @classmethod
+    def setup(cls, log_file: str, level: str):
+        """Инициализация логгера."""
+        cls._instance = BotLogger(log_file, level)
+    
+    def debug(self, msg: str, *args, **kwargs):
+        self._logger.debug(msg, *args, **kwargs)
+    
+    def info(self, msg: str, *args, **kwargs):
+        self._logger.info(msg, *args, **kwargs)
+    
+    def warning(self, msg: str, *args, **kwargs):
+        self._logger.warning(msg, *args, **kwargs)
+    
+    def error(self, msg: str, *args, **kwargs):
+        self._logger.error(msg, *args, **kwargs)
+    
+    def critical(self, msg: str, *args, **kwargs):
+        self._logger.critical(msg, *args, **kwargs)
+    
+    def exception(self, msg: str, *args, **kwargs):
+        self._logger.exception(msg, *args, **kwargs)
+
+
+def get_logger() -> BotLogger:
+    """Удобная функция для получения логгера."""
+    return BotLogger.get()
+
+
+# =============================================================================
+# МЕНЕДЖЕР БАЗЫ ДАННЫХ
+# =============================================================================
+
+class DatabaseManager:
+    """
+    Менеджер базы данных с пулом соединений.
+    Обеспечивает потокобезопасный доступ к PostgreSQL.
+    """
+    
+    _instance: Optional["DatabaseManager"] = None
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self._pool: Optional[pool.ThreadedConnectionPool] = None
+        self._lock = threading.Lock()
+        self._logger = get_logger()
+        self._connected = False
+    
+    @classmethod
+    def get_instance(cls, config: BotConfig) -> "DatabaseManager":
+        """Создаёт или возвращает singleton-экземпляр."""
+        if cls._instance is None:
+            cls._instance = DatabaseManager(config)
+        return cls._instance
+    
+    def connect(self) -> bool:
+        """Создаёт пул соединений к БД."""
+        try:
+            self._logger.info(f"Подключение к БД: {self.config.db_host}:{self.config.db_port}/{self.config.db_name}")
+            
+            # Решение проблемы кодировки: явное указание кодировки
+            self._pool = pool.ThreadedConnectionPool(
+                minconn=DB_MIN_CONNECTIONS,
+                maxconn=DB_MAX_CONNECTIONS,
+                host=self.config.db_host,
+                port=self.config.db_port,
+                dbname=self.config.db_name,
+                user=self.config.db_user,
+                password=self.config.db_password,
+                connect_timeout=DB_CONNECTION_TIMEOUT,
+                options="-c client_encoding=UTF8",
+                cursor_factory=RealDictCursor
+            )
+            
+            # Тестовое подключение
+            conn = self._pool.getconn()
+            cur = conn.cursor()
+            cur.execute("SELECT version();")
+            version = cur.fetchone()
+            self._pool.putconn(conn)
+            
+            self._connected = True
+            self._logger.info(f"✅ БД подключена: {version['version'][:60]}...")
+            return True
+            
+        except pg_errors.OperationalError as e:
+            self._logger.error(f"❌ Ошибка подключения к БД (OperationalError): {e}")
+            self._connected = False
+            return False
+        except pg_errors.AuthenticationError as e:
+            self._logger.error(f"❌ Ошибка аутентификации БД: {e}")
+            self._connected = False
+            return False
+        except Exception as e:
+            # Обработка ошибки кодировки
+            error_str = str(e)
+            if "utf-8" in error_str.lower() or "codec" in error_str.lower():
+                self._logger.error(
+                    "❌ Ошибка кодировки при подключении к БД! "
+                    "Проверьте, что пароль в .env не содержит нестандартных символов. "
+                    f"Детали: {e}"
                 )
-                send_msg(hw["user_vk_id"], text)
-                mark_hw_reminder_sent(hw["id"], now.date())
+            else:
+                self._logger.error(f"❌ Неожиданная ошибка БД: {e}")
+            self._connected = False
+            return False
+    
+    def disconnect(self):
+        """Закрывает все соединения пула."""
+        if self._pool:
+            self._pool.closeall()
+            self._pool = None
+        self._connected = False
+        self._logger.info("БД отключена.")
+    
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._pool is not None
+    
+    def _get_conn(self):
+        """Получает соединение из пула."""
+        if not self._pool:
+            raise RuntimeError("Пул соединений не инициализирован!")
+        return self._pool.getconn()
+    
+    def _put_conn(self, conn):
+        """Возвращает соединение в пул."""
+        if self._pool:
+            self._pool.putconn(conn)
+    
+    def _safe_execute(self, query: str, params: tuple = None, fetch: str = "none") -> Any:
+        """
+        Безопасное выполнение запроса с автоматическим возвратом соединения.
+        
+        :param query: SQL-запрос
+        :param params: параметры запроса
+        :param fetch: "none", "one", "all"
+        :return: результат или None
+        """
+        conn = None
+        try:
+            conn = self._get_conn()
+            cur = conn.cursor()
+            cur.execute(query, params or ())
+            
+            result = None
+            if fetch == "one":
+                result = cur.fetchone()
+            elif fetch == "all":
+                result = cur.fetchall()
+            elif fetch == "rowcount":
+                result = cur.rowcount
+            
+            conn.commit()
+            cur.close()
+            return result
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            self._logger.error(f"Ошибка SQL: {e}\nЗапрос: {query[:200]}")
+            raise
+        finally:
+            if conn:
+                self._put_conn(conn)
+    
+    # --- Методы для работы с таблицами ---
+    
+    def init_tables(self):
+        """Создаёт все необходимые таблицы, если их нет."""
+        self._logger.info("Проверка и создание таблиц БД...")
+        
+        # Таблица пользователей
+        self._safe_execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                vk_id BIGINT NOT NULL UNIQUE,
+                username VARCHAR(255),
+                first_name VARCHAR(255) DEFAULT '',
+                last_name VARCHAR(255) DEFAULT '',
+                role VARCHAR(50) DEFAULT 'user',
+                status VARCHAR(50) DEFAULT 'active',
+                messages_count INTEGER DEFAULT 0,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица истории сообщений
+        self._safe_execute("""
+            CREATE TABLE IF NOT EXISTS dialog_history (
+                id SERIAL PRIMARY KEY,
+                vk_id BIGINT NOT NULL,
+                role VARCHAR(20) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT fk_dialog_user FOREIGN KEY (vk_id) 
+                    REFERENCES users(vk_id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Таблица сессий (диалогов)
+        self._safe_execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY,
+                vk_id BIGINT NOT NULL UNIQUE,
+                session_uuid VARCHAR(100),
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT fk_session_user FOREIGN KEY (vk_id) 
+                    REFERENCES users(vk_id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Таблица статистики бота
+        self._safe_execute("""
+            CREATE TABLE IF NOT EXISTS bot_stats (
+                id SERIAL PRIMARY KEY,
+                stat_key VARCHAR(100) NOT NULL,
+                stat_value BIGINT DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица логов ошибок
+        self._safe_execute("""
+            CREATE TABLE IF NOT EXISTS error_logs (
+                id SERIAL PRIMARY KEY,
+                error_type VARCHAR(100),
+                error_message TEXT,
+                stack_trace TEXT,
+                vk_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица заблокированных пользователей (анти-спам)
+        self._safe_execute("""
+            CREATE TABLE IF NOT EXISTS spam_bans (
+                id SERIAL PRIMARY KEY,
+                vk_id BIGINT NOT NULL,
+                ban_reason VARCHAR(255),
+                banned_until TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT fk_ban_user FOREIGN KEY (vk_id) 
+                    REFERENCES users(vk_id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Индексы
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_users_vk_id ON users(vk_id)")
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_dialog_vk_id ON dialog_history(vk_id)")
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_dialog_created ON dialog_history(created_at)")
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_sessions_vk_id ON sessions(vk_id)")
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_stats_key ON bot_stats(stat_key)")
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_errors_vk_id ON error_logs(vk_id)")
+        self._safe_execute("CREATE INDEX IF NOT EXISTS idx_bans_vk_id ON spam_bans(vk_id)")
+        
+        self._logger.info("✅ Все таблицы БД готовы.")
+    
+    # --- Методы для работы с пользователями ---
+    
+    def get_or_create_user(self, vk_id: int, username: str = "", 
+                           first_name: str = "", last_name: str = "") -> UserInfo:
+        """Получает или создаёт пользователя в БД."""
+        # Сначала пробуем найти
+        row = self._safe_execute(
+            "SELECT * FROM users WHERE vk_id = %s",
+            (vk_id,),
+            fetch="one"
+        )
+        
+        if row:
+            # Обновляем last_seen и, возможно, имя
+            update_fields = ["last_seen = CURRENT_TIMESTAMP"]
+            update_params: list = []
+            
+            if first_name and row.get('first_name', '') != first_name:
+                update_fields.append("first_name = %s")
+                update_params.append(first_name)
+            if last_name and row.get('last_name', '') != last_name:
+                update_fields.append("last_name = %s")
+                update_params.append(last_name)
+            if username and row.get('username', '') != username:
+                update_fields.append("username = %s")
+                update_params.append(username)
+            
+            update_params.append(vk_id)
+            self._safe_execute(
+                f"UPDATE users SET {', '.join(update_fields)} WHERE vk_id = %s",
+                tuple(update_params)
+            )
+            
+            return self._row_to_user(row)
+        
+        # Создаём нового
+        self._safe_execute(
+            """INSERT INTO users (vk_id, username, first_name, last_name) 
+               VALUES (%s, %s, %s, %s)""",
+            (vk_id, username, first_name, last_name)
+        )
+        
+        # Получаем обратно
+        row = self._safe_execute(
+            "SELECT * FROM users WHERE vk_id = %s",
+            (vk_id,),
+            fetch="one"
+        )
+        self._logger.info(f"Новый пользователь: {vk_id} ({first_name} {last_name})")
+        return self._row_to_user(row)
+    
+    def _row_to_user(self, row: Optional[Dict]) -> UserInfo:
+        """Преобразует строку БД в объект UserInfo."""
+        if not row:
+            return UserInfo()
+        return UserInfo(
+            vk_id=row.get('vk_id', 0),
+            username=row.get('username', ''),
+            first_name=row.get('first_name', ''),
+            last_name=row.get('last_name', ''),
+            role=row.get('role', UserRole.USER.value),
+            status=row.get('status', UserStatus.ACTIVE.value),
+            messages_count=row.get('messages_count', 0),
+            first_seen=row.get('first_seen'),
+            last_seen=row.get('last_seen'),
+        )
+    
+    def increment_user_messages(self, vk_id: int):
+        """Увеличивает счётчик сообщений пользователя."""
+        self._safe_execute(
+            "UPDATE users SET messages_count = messages_count + 1, last_seen = CURRENT_TIMESTAMP WHERE vk_id = %s",
+            (vk_id,)
+        )
+    
+    def update_user_role(self, vk_id: int, role: str):
+        """Обновляет роль пользователя."""
+        self._safe_execute(
+            "UPDATE users SET role = %s WHERE vk_id = %s",
+            (role, vk_id)
+        )
+    
+    def update_user_status(self, vk_id: int, status: str):
+        """Обновляет статус пользователя."""
+        self._safe_execute(
+            "UPDATE users SET status = %s WHERE vk_id = %s",
+            (status, vk_id)
+        )
+    
+    def get_user(self, vk_id: int) -> Optional[UserInfo]:
+        """Получает пользователя по VK ID."""
+        row = self._safe_execute(
+            "SELECT * FROM users WHERE vk_id = %s",
+            (vk_id,),
+            fetch="one"
+        )
+        return self._row_to_user(row) if row else None
+    
+    def get_all_users(self, limit: int = 100, offset: int = 0) -> List[UserInfo]:
+        """Возвращает список всех пользователей."""
+        rows = self._safe_execute(
+            "SELECT * FROM users ORDER BY first_seen DESC LIMIT %s OFFSET %s",
+            (limit, offset),
+            fetch="all"
+        )
+        return [self._row_to_user(r) for r in rows] if rows else []
+    
+    def get_top_users(self, limit: int = 10) -> List[UserInfo]:
+        """Возвращает топ активных пользователей."""
+        rows = self._safe_execute(
+            "SELECT * FROM users WHERE status = 'active' ORDER BY messages_count DESC LIMIT %s",
+            (limit,),
+            fetch="all"
+        )
+        return [self._row_to_user(r) for r in rows] if rows else []
+    
+    def get_total_users(self) -> int:
+        """Возвращает общее количество пользователей."""
+        row = self._safe_execute("SELECT COUNT(*) as cnt FROM users", fetch="one")
+        return row['cnt'] if row else 0
+    
+    def delete_user(self, vk_id: int):
+        """Удаляет пользователя и все его данные (каскадно)."""
+        self._safe_execute("DELETE FROM users WHERE vk_id = %s", (vk_id,))
+    
+    # --- Методы для истории диалогов ---
+    
+    def add_message(self, vk_id: int, role: str, content: str):
+        """Добавляет сообщение в историю диалога."""
+        self._safe_execute(
+            "INSERT INTO dialog_history (vk_id, role, content) VALUES (%s, %s, %s)",
+            (vk_id, role, content[:5000])  # Ограничение длины
+        )
+    
+    def get_history(self, vk_id: int, limit: int = MAX_HISTORY_MESSAGES) -> List[MessageHistory]:
+        """Возвращает историю диалога пользователя."""
+        rows = self._safe_execute(
+            """SELECT * FROM dialog_history 
+               WHERE vk_id = %s 
+               ORDER BY created_at DESC LIMIT %s""",
+            (vk_id, limit),
+            fetch="all"
+        )
+        if not rows:
+            return []
+        # Разворачиваем в хронологическом порядке
+        rows = list(reversed(rows))
+        return [
+            MessageHistory(
+                id=r['id'],
+                vk_id=r['vk_id'],
+                role=r['role'],
+                content=r['content'],
+                created_at=r['created_at']
+            )
+            for r in rows
+        ]
+    
+    def clear_history(self, vk_id: int) -> int:
+        """Очищает историю диалога пользователя. Возвращает количество удалённых."""
+        result = self._safe_execute(
+            "DELETE FROM dialog_history WHERE vk_id = %s",
+            (vk_id,),
+            fetch="rowcount"
+        )
+        return result or 0
+    
+    def get_history_count(self, vk_id: int) -> int:
+        """Возвращает количество сообщений в истории пользователя."""
+        row = self._safe_execute(
+            "SELECT COUNT(*) as cnt FROM dialog_history WHERE vk_id = %s",
+            (vk_id,),
+            fetch="one"
+        )
+        return row['cnt'] if row else 0
+    
+    # --- Методы для сессий ---
+    
+    def get_or_create_session(self, vk_id: int) -> str:
+        """Создаёт или получает UUID сессии для пользователя."""
+        row = self._safe_execute(
+            "SELECT session_uuid FROM sessions WHERE vk_id = %s AND is_active = TRUE",
+            (vk_id,),
+            fetch="one"
+        )
+        if row and row['session_uuid']:
+            return row['session_uuid']
+        
+        # Создаём новую сессию
+        session_uuid = hashlib.md5(f"{vk_id}_{time.time()}_{random.randint(0, 999999)}".encode()).hexdigest()
+        self._safe_execute(
+            """INSERT INTO sessions (vk_id, session_uuid, is_active) 
+               VALUES (%s, %s, TRUE)
+               ON CONFLICT (vk_id) DO UPDATE SET session_uuid = EXCLUDED.session_uuid, is_active = TRUE, updated_at = CURRENT_TIMESTAMP""",
+            (vk_id, session_uuid)
+        )
+        return session_uuid
+    
+    def deactivate_session(self, vk_id: int):
+        """Деактивирует сессию пользователя."""
+        self._safe_execute(
+            "UPDATE sessions SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE vk_id = %s",
+            (vk_id,)
+        )
+    
+    # --- Методы для статистики ---
+    
+    def get_stat(self, key: str) -> int:
+        """Получает значение статистики по ключу."""
+        row = self._safe_execute(
+            "SELECT stat_value FROM bot_stats WHERE stat_key = %s",
+            (key,),
+            fetch="one"
+        )
+        return row['stat_value'] if row else 0
+    
+    def set_stat(self, key: str, value: int):
+        """Устанавливает значение статистики."""
+        self._safe_execute(
+            """INSERT INTO bot_stats (stat_key, stat_value, updated_at) 
+               VALUES (%s, %s, CURRENT_TIMESTAMP)
+               ON CONFLICT DO NOTHING""",
+            (key, value)
+        )
+        self._safe_execute(
+            "UPDATE bot_stats SET stat_value = %s, updated_at = CURRENT_TIMESTAMP WHERE stat_key = %s",
+            (value, key)
+        )
+    
+    def increment_stat(self, key: str, by: int = 1):
+        """Увеличивает значение статистики."""
+        self._safe_execute(
+            """INSERT INTO bot_stats (stat_key, stat_value, updated_at) 
+               VALUES (%s, %s, CURRENT_TIMESTAMP)
+               ON CONFLICT DO NOTHING""",
+            (key, 0)
+        )
+        self._safe_execute(
+            "UPDATE bot_stats SET stat_value = stat_value + %s, updated_at = CURRENT_TIMESTAMP WHERE stat_key = %s",
+            (by, key)
+        )
+    
+    # --- Методы для логов ошибок ---
+    
+    def log_error(self, error_type: str, error_message: str, 
+                  stack_trace: str = "", vk_id: int = 0):
+        """Записывает ошибку в БД."""
+        try:
+            self._safe_execute(
+                """INSERT INTO error_logs (error_type, error_message, stack_trace, vk_id) 
+                   VALUES (%s, %s, %s, %s)""",
+                (error_type, error_message[:500], stack_trace[:2000], vk_id)
+            )
+        except Exception as e:
+            # Если не удалось записать ошибку в БД, логируем в файл
+            get_logger().error(f"Не удалось записать ошибку в БД: {e}")
+    
+    def get_recent_errors(self, limit: int = 10) -> List[Dict]:
+        """Возвращает последние ошибки из БД."""
+        rows = self._safe_execute(
+            "SELECT * FROM error_logs ORDER BY created_at DESC LIMIT %s",
+            (limit,),
+            fetch="all"
+        )
+        return rows if rows else []
+    
+    # --- Методы для анти-спама ---
+    
+    def ban_user_spam(self, vk_id: int, reason: str, duration: int = ANTISPAM_BAN_DURATION):
+        """Банит пользователя за спам."""
+        ban_until = datetime.datetime.now() + datetime.timedelta(seconds=duration)
+        self._safe_execute(
+            """INSERT INTO spam_bans (vk_id, ban_reason, banned_until) 
+               VALUES (%s, %s, %s)""",
+            (vk_id, reason, ban_until)
+        )
+        self.update_user_status(vk_id, UserStatus.BANNED.value)
+    
+    def unban_user_spam(self, vk_id: int):
+        """Разбанивает пользователя."""
+        self._safe_execute(
+            "DELETE FROM spam_bans WHERE vk_id = %s",
+            (vk_id,)
+        )
+        self.update_user_status(vk_id, UserStatus.ACTIVE.value)
+    
+    def is_user_banned(self, vk_id: int) -> bool:
+        """Проверяет, забанен ли пользователь."""
+        row = self._safe_execute(
+            "SELECT banned_until FROM spam_bans WHERE vk_id = %s AND banned_until > NOW()",
+            (vk_id,),
+            fetch="one"
+        )
+        return row is not None
+    
+    def clean_expired_bans(self):
+        """Удаляет истекшие баны."""
+        self._safe_execute("DELETE FROM spam_bans WHERE banned_until < NOW()")
+    
+    # --- Резервное копирование ---
+    
+    def get_stats_summary(self) -> Dict[str, Any]:
+        """Возвращает сводную статистику БД."""
+        result = {}
+        
+        result['total_users'] = self.get_total_users()
+        result['active_users'] = self._safe_execute(
+            "SELECT COUNT(*) as cnt FROM users WHERE status = 'active'",
+            fetch="one"
+        )['cnt'] if self._safe_execute(
+            "SELECT COUNT(*) as cnt FROM users WHERE status = 'active'",
+            fetch="one"
+        ) else 0
+        
+        msg_row = self._safe_execute("SELECT COUNT(*) as cnt FROM dialog_history", fetch="one")
+        result['total_messages'] = msg_row['cnt'] if msg_row else 0
+        
+        result['total_sessions'] = self._safe_execute(
+            "SELECT COUNT(*) as cnt FROM sessions WHERE is_active = TRUE",
+            fetch="one"
+        )['cnt'] if self._safe_execute(
+            "SELECT COUNT(*) as cnt FROM sessions WHERE is_active = TRUE",
+            fetch="one"
+        ) else 0
+        
+        return result
+
+
+# =============================================================================
+# МЕНЕДЖЕР VK API
+# =============================================================================
+
+class VKManager:
+    """
+    Менеджер VK API с обработкой ошибок, ретраями и корректным парсингом ответов.
+    """
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self._logger = get_logger()
+        self._vk_session: Optional[vk_api.VkApi] = None
+        self._vk: Optional[Any] = None
+        self._vk_longpoll: Optional[Any] = None
+        self._group_id: int = 0
+        self._group_name: str = ""
+        self._connected = False
+    
+    def connect(self) -> bool:
+        """Подключается к VK API и проверяет токен."""
+        try:
+            self._logger.info("Подключение к VK API...")
+            
+            if not self.config.vk_token:
+                self._logger.error("VK_TOKEN пуст!")
+                return False
+            
+            self._vk_session = vk_api.VkApi(token=self.config.vk_token, api_version=VK_API_VERSION)
+            self._vk = self._vk_session.get_api()
+            
+            # Получаем информацию о группе
+            # ВАЖНО: VK возвращает СПИСОК, даже если группа одна!
+            groups_info = self._vk.groups.getById()
+            
+            if isinstance(groups_info, list):
+                if len(groups_info) > 0:
+                    group = groups_info[0]
+                    self._group_id = group.get('id', 0)
+                    self._group_name = group.get('name', 'Без названия')
+                else:
+                    self._logger.error("Список групп пуст! Возможно, токен не от сообщества.")
+                    return False
+            elif isinstance(groups_info, dict):
+                # Иногда VK возвращает словарь с ключом 'groups'
+                if 'groups' in groups_info and isinstance(groups_info['groups'], list):
+                    if len(groups_info['groups']) > 0:
+                        group = groups_info['groups'][0]
+                        self._group_id = group.get('id', 0)
+                        self._group_name = group.get('name', 'Без названия')
+                    else:
+                        self._logger.error("Список групп в ответе пуст!")
+                        return False
+                else:
+                    self._group_id = groups_info.get('id', 0)
+                    self._group_name = groups_info.get('name', 'Без названия')
+            else:
+                self._logger.error(f"Неожиданный формат ответа VK: {type(groups_info)}")
+                return False
+            
+            if not self._group_id:
+                self._logger.error("Не удалось получить ID группы!")
+                return False
+            
+            self._connected = True
+            self._logger.info(f"✅ VK API: группа «{self._group_name}» (ID: {self._group_id})")
+            return True
+            
+        except ApiError as e:
+            self._logger.error(f"❌ Ошибка VK API: {e}")
+            return False
+        except Exception as e:
+            self._logger.error(f"❌ Критическая ошибка VK: {e}")
+            self._logger.debug(traceback.format_exc())
+            return False
+    
+    def init_longpoll(self) -> bool:
+        """Инициализирует Long Polling для получения сообщений."""
+        try:
+            from vk_api.bot_longpoll import VkBotLongPoll, VkBotLongPollMode
+            self._vk_longpoll = VkBotLongPoll(
+                self._vk_session,
+                self._group_id,
+                wait=VK_LONG_POLL_WAIT,
+                mode=VkBotLongPollMode.GET_EVENT_LISTENERS if hasattr(VkBotLongPollMode, 'GET_EVENT_LISTENERS') else VK_LONG_POLL_MODE
+            )
+            self._logger.info("✅ Long Polling инициализирован.")
+            return True
+        except ImportError:
+            self._logger.warning("VkBotLongPoll недоступен. Используем ручной Long Polling.")
+            return self._init_manual_longpoll()
+        except Exception as e:
+            self._logger.error(f"Ошибка инициализации Long Polling: {e}")
+            return self._init_manual_longpoll()
+    
+    def _init_manual_longpoll(self) -> bool:
+        """Ручная инициализация Long Polling через API."""
+        try:
+            # Получаем сервер для Long Polling
+            server_info = self._vk.groups.getLongPollServer(group_id=self._group_id)
+            self._lp_server = server_info.get('server', '')
+            self._lp_key = server_info.get('key', '')
+            self._lp_ts = server_info.get('ts', '')
+            
+            if not self._lp_server or not self._lp_key:
+                self._logger.error("Не удалось получить данные Long Polling сервера!")
+                return False
+            
+            self._logger.info("✅ Ручной Long Polling инициализирован.")
+            return True
+        except Exception as e:
+            self._logger.error(f"Ошибка ручного Long Polling: {e}")
+            return False
+    
+    def get_longpoll_events(self) -> List[Dict]:
+        """
+        Получает события через ручной Long Polling.
+        Возвращает список событий.
+        """
+        try:
+            if self._vk_longpoll:
+                # Используем библиотечный Long Polling
+                # Этот метод вызывается из run() — не используется напрямую
+                return []
+            
+            url = self._lp_server
+            params = {
+                'act': 'a_check',
+                'key': self._lp_key,
+                'ts': self._lp_ts,
+                'wait': VK_LONG_POLL_WAIT,
+                'mode': VK_LONG_POLL_MODE,
+                'version': VK_LONG_POLL_VERSION
+            }
+            
+            response = requests.get(url, params=params, timeout=VK_LONG_POLL_WAIT + 5)
+            data = response.json()
+            
+            if 'failed' in data:
+                error_code = data['failed']
+                if error_code == 1:
+                    # История устарела — обновляем ts
+                    self._lp_ts = data.get('ts', self._lp_ts)
+                    return []
+                elif error_code == 2:
+                    # Ключ устарел — получаем новый
+                    self._init_manual_longpoll()
+                    return []
+                elif error_code == 3:
+                    # Информация утрачена — получаем новый сервер
+                    self._init_manual_longpoll()
+                    return []
+                else:
+                    self._logger.warning(f"Long Polling вернул ошибку: {error_code}")
+                    return []
+            
+            self._lp_ts = data.get('ts', self._lp_ts)
+            return data.get('events', [])
+            
+        except requests.Timeout:
+            return []
+        except Exception as e:
+            self._logger.error(f"Ошибка получения событий Long Polling: {e}")
+            return []
+    
+    def send_message(self, user_id: int, message: str, 
+                     keyboard: Optional[str] = None,
+                     reply_to: Optional[int] = None,
+                     attachment: Optional[str] = None) -> bool:
+        """
+        Отправляет сообщение пользователю с повторными попытками.
+        
+        :param user_id: VK ID получателя
+        :param message: текст сообщения
+        :param keyboard: JSON клавиатуры
+        :param reply_to: ID сообщения для ответа
+        :param attachment: строка вложений
+        :return: True если успешно
+        """
+        if not self._vk:
+            self._logger.error("VK API не инициализирован!")
+            return False
+        
+        # Разбиваем длинные сообщения
+        messages = self._split_message(message)
+        
+        for i, msg_part in enumerate(messages):
+            success = False
+            for attempt in range(MAX_RETRIES_VK):
+                try:
+                    params = {
+                        'user_id': user_id,
+                        'message': msg_part,
+                        'random_id': random.randint(0, 2**31 - 1),
+                    }
+                    if keyboard:
+                        params['keyboard'] = keyboard
+                    if reply_to and i == 0:
+                        params['reply_to'] = reply_to
+                    if attachment:
+                        params['attachment'] = attachment
+                    
+                    self._vk.messages.send(**params)
+                    success = True
+                    break
+                    
+                except ApiError as e:
+                    error_code = getattr(e, 'code', 0)
+                    if error_code == 900:  # Нельзя отправить сообщение пользователю
+                        self._logger.warning(f"Нельзя отправить сообщение пользователю {user_id}: {e}")
+                        return False
+                    elif error_code == 901:  # Пользователь запретил сообщения
+                        self._logger.info(f"Пользователь {user_id} запретил сообщения")
+                        return False
+                    elif error_code == 913:  # Слишком много сообщений
+                        time.sleep(1)
+                        continue
+                    elif error_code == 6:  # Слишком много запросов
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        self._logger.error(f"Ошибка отправки (попытка {attempt+1}): {e}")
+                        time.sleep(0.3 * (attempt + 1))
+                except Exception as e:
+                    self._logger.error(f"Неожиданная ошибка отправки: {e}")
+                    time.sleep(0.3 * (attempt + 1))
+            
+            if not success:
+                self._logger.error(f"Не удалось отправить сообщение юзеру {user_id} после {MAX_RETRIES_VK} попыток")
+                return False
+            
+            time.sleep(VK_SEND_DELAY)
+        
+        return True
+    
+    def _split_message(self, message: str) -> List[str]:
+        """Разбивает длинное сообщение на части (до MAX_MESSAGE_LENGTH символов)."""
+        if len(message) <= MAX_MESSAGE_LENGTH:
+            return [message]
+        
+        parts = []
+        while len(message) > 0:
+            if len(message) <= MAX_MESSAGE_LENGTH:
+                parts.append(message)
+                break
+            
+            # Ищем перенос строки для красивого разбиения
+            split_pos = message.rfind('\n', 0, MAX_MESSAGE_LENGTH)
+            if split_pos == -1:
+                split_pos = message.rfind(' ', 0, MAX_MESSAGE_LENGTH)
+            if split_pos == -1:
+                split_pos = MAX_MESSAGE_LENGTH
+            
+            parts.append(message[:split_pos])
+            message = message[split_pos:].lstrip()
+        
+        return parts
+    
+    def get_user_info(self, user_id: int) -> Dict[str, str]:
+        """Получает информацию о пользователе из VK."""
+        try:
+            info = self._vk.users.get(user_ids=user_id, fields='first_name,last_name,screen_name')
+            if isinstance(info, list) and len(info) > 0:
+                user_data = info[0]
+                return {
+                    'first_name': user_data.get('first_name', ''),
+                    'last_name': user_data.get('last_name', ''),
+                    'username': user_data.get('screen_name', ''),
+                }
+        except Exception as e:
+            self._logger.warning(f"Не удалось получить инфо о пользователе {user_id}: {e}")
+        return {}
+    
+    def send_typing(self, user_id: int):
+        """Отправляет индикатор 'печатает...'."""
+        try:
+            self._vk.messages.setActivity(peer_id=user_id, type='typing')
+        except Exception:
+            pass  # Не критично
+    
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+    
+    @property
+    def group_name(self) -> str:
+        return self._group_name
+    
+    @property
+    def group_id(self) -> int:
+        return self._group_id
+
+
+# =============================================================================
+# МЕНЕДЖЕР GIGACHAT
+# =============================================================================
+
+class GigaChatManager:
+    """
+    Менеджер интеграции с GigaChat API.
+    Поддерживает аутентификацию, повторные попытки и обработку ошибок.
+    """
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self._logger = get_logger()
+        self._access_token: Optional[str] = None
+        self._token_expires: float = 0
+        self._session = requests.Session()
+        self._connected = False
+        self._call_count = 0
+        self._error_count = 0
+    
+    def authenticate(self) -> bool:
+        """Получает access token для GigaChat API."""
+        if not self.config.enable_gigachat:
+            self._logger.info("GigaChat отключён в конфигурации.")
+            return False
+        
+        if not self.config.gigachat_client_id or not self.config.gigachat_client_secret:
+            self._logger.error("GigaChat: не указаны CLIENT_ID или CLIENT_SECRET!")
+            return False
+        
+        try:
+            self._logger.info("Аутентификация в GigaChat...")
+            
+            # Формируем Basic Auth из client_id:client_secret
+            auth_string = f"{self.config.gigachat_client_id}:{self.config.gigachat_client_secret}"
+            
+            response = requests.post(
+                f"{GIGACHAT_AUTH_URL}/oauth",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {self._base64_encode(auth_string)}"
+                },
+                data={"scope": "GIGACHAT_API_PERS"},
+                timeout=30,
+                verify=False  # Для тестового API
+            )
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                self._access_token = token_data.get("access_token", "")
+                # Токен обычно действителен ~30 минут
+                expires_in = token_data.get("expires_in", 1800)
+                self._token_expires = time.time() + expires_in - 60  # Запас 60 сек
+                self._connected = True
+                self._logger.info("✅ GigaChat: аутентификация успешна.")
+                return True
+            else:
+                self._logger.error(f"GigaChat: ошибка аутентификации (HTTP {response.status_code}): {response.text[:200]}")
+                self._connected = False
+                return False
+                
+        except requests.exceptions.SSLError as e:
+            self._logger.error(f"GigaChat: SSL ошибка: {e}")
+            self._connected = False
+            return False
+        except requests.exceptions.ConnectionError as e:
+            self._logger.error(f"GigaChat: ошибка соединения: {e}")
+            self._connected = False
+            return False
+        except Exception as e:
+            self._logger.error(f"GigaChat: неожиданная ошибка аутентификации: {e}")
+            self._logger.debug(traceback.format_exc())
+            self._connected = False
+            return False
+    
+    def _base64_encode(self, text: str) -> str:
+        """Кодирует строку в Base64."""
+        import base64
+        return base64.b64encode(text.encode('utf-8')).decode('utf-8')
+    
+    def _ensure_token(self) -> bool:
+        """Проверяет валидность токена и обновляет при необходимости."""
+        if not self._connected and not self.config.enable_gigachat:
+            return False
+        
+        if self._access_token and time.time() < self._token_expires:
+            return True
+        
+        # Токен истёк — обновляем
+        return self.authenticate()
+    
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7, 
+             max_tokens: int = 1000) -> Optional[str]:
+        """
+        Отправляет запрос к GigaChat и возвращает ответ.
+        
+        :param messages: список сообщений [{"role": "user", "content": "..."}]
+        :param temperature: креативность (0-1)
+        :param max_tokens: максимальная длина ответа
+        :return: текст ответа или None при ошибке
+        """
+        if not self._ensure_token():
+            self._logger.error("GigaChat: нет валидного токена!")
+            return None
+        
+        # Добавляем системный промпт в начало, если его нет
+        chat_messages = list(messages)
+        if not chat_messages or chat_messages[0].get('role') != 'system':
+            chat_messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        
+        for attempt in range(GIGACHAT_MAX_RETRIES):
+            try:
+                response = requests.post(
+                    f"{GIGACHAT_API_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self._access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": GIGACHAT_MODEL,
+                        "messages": chat_messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                    timeout=GIGACHAT_TIMEOUT,
+                    verify=False
+                )
+                
+                self._call_count += 1
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    choices = data.get("choices", [])
+                    if choices and len(choices) > 0:
+                        content = choices[0].get("message", {}).get("content", "")
+                        if content:
+                            return content.strip()
+                    
+                    self._logger.warning("GigaChat: пустой ответ в choices")
+                    return None
+                elif response.status_code == 401:
+                    # Токен истёк — обновляем и повторяем
+                    self._logger.warning("GigaChat: токен истёк, обновление...")
+                    self.authenticate()
+                    continue
+                elif response.status_code == 429:
+                    # Превышен лимит запросов
+                    self._logger.warning(f"GigaChat: лимит запросов (попытка {attempt+1})")
+                    time.sleep(GIGACHAT_RETRY_DELAY * (attempt + 1))
+                    continue
+                elif response.status_code == 400:
+                    self._logger.error(f"GigaChat: неверный запрос: {response.text[:300]}")
+                    return None
+                else:
+                    self._logger.error(f"GigaChat: HTTP {response.status_code}: {response.text[:300]}")
+                    time.sleep(GIGACHAT_RETRY_DELAY * (attempt + 1))
+                    
+            except requests.Timeout:
+                self._logger.warning(f"GigaChat: таймаут (попытка {attempt+1}/{GIGACHAT_MAX_RETRIES})")
+                time.sleep(GIGACHAT_RETRY_DELAY)
+            except requests.exceptions.ConnectionError as e:
+                self._logger.error(f"GigaChat: ошибка соединения: {e}")
+                time.sleep(GIGACHAT_RETRY_DELAY)
             except Exception as e:
-                logging.error(f"HW reminder failed: {e}")
+                self._logger.error(f"GigaChat: неожиданная ошибка: {e}")
+                self._logger.debug(traceback.format_exc())
+                time.sleep(GIGACHAT_RETRY_DELAY)
+        
+        self._error_count += 1
+        self._logger.error(f"GigaChat: все {GIGACHAT_MAX_RETRIES} попыток исчерпаны.")
+        return None
+    
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+    
+    @property
+    def call_count(self) -> int:
+        return self._call_count
+    
+    @property
+    def error_count(self) -> int:
+        return self._error_count
 
-def setup_scheduler():
-    scheduler.add_job(morning_motivation, CronTrigger(hour=MORNING_HOUR, minute=0))
-    scheduler.add_job(evening_motivation, CronTrigger(hour=EVENING_HOUR, minute=0))
-    scheduler.add_job(check_reminders_and_hw, "interval", minutes=REMINDER_CHECK_MIN)
 
-# ============================================================
-#  ГЛАВНЫЙ ЦИКЛ
-# ============================================================
+# =============================================================================
+# АНТИ-СПАМ СИСТЕМА
+# =============================================================================
 
-def handle_message(event, vk):
-    user_id = event.user_id
-    raw_text = event.text or ""
-    text = raw_text.strip().lower()
-    user = get_user(user_id)
-    update_last_active(user_id)
+class AntispamSystem:
+    """
+    Система защиты от спама на основе временных окон.
+    Отслеживает частоту сообщений от каждого пользователя.
+    """
+    
+    def __init__(self, db: DatabaseManager, enabled: bool = True):
+        self._db = db
+        self._enabled = enabled
+        self._logger = get_logger()
+        self._entries: Dict[int, AntispamEntry] = {}
+        self._lock = threading.Lock()
+    
+    def check(self, vk_id: int) -> Tuple[bool, str]:
+        """
+        Проверяет, не спамит ли пользователь.
+        
+        :return: (True если можно отправить, причина запрета если нет)
+        """
+        if not self._enabled:
+            return True, ""
+        
+        # Сначала проверяем бан в БД
+        if self._db.is_user_banned(vk_id):
+            return False, "Вы временно заблокированы за спам. Попробуйте позже."
+        
+        now = time.time()
+        
+        with self._lock:
+            entry = self._entries.get(vk_id)
+            
+            if entry is None:
+                entry = AntispamEntry()
+                self._entries[vk_id] = entry
+            
+            # Проверяем активный бан
+            if entry.banned_until > now:
+                remaining = int(entry.banned_until - now)
+                return False, f"Анти-спам: подождите {remaining} сек."
+            
+            # Очищаем старые сообщения (вне окна)
+            entry.messages = [t for t in entry.messages if now - t < ANTISPAM_WINDOW]
+            
+            # Добавляем текущее
+            entry.messages.append(now)
+            
+            # Проверяем лимит
+            if len(entry.messages) > ANTISPAM_MAX_MESSAGES:
+                # Баним
+                entry.banned_until = now + ANTISPAM_BAN_DURATION
+                self._db.ban_user_spam(vk_id, f"Превышение лимита: {len(entry.messages)} сообщений за {ANTISPAM_WINDOW} сек.")
+                self._logger.warning(f"Анти-спам: пользователь {vk_id} забанен на {ANTISPAM_BAN_DURATION} сек.")
+                return False, f"⚠️ Слишком много сообщений! Вы заблокированы на {ANTISPAM_BAN_DURATION} секунд."
+        
+        return True, ""
+    
+    def reset(self, vk_id: int):
+        """Сбрасывает счётчик для пользователя."""
+        with self._lock:
+            if vk_id in self._entries:
+                self._entries[vk_id].messages.clear()
+                self._entries[vk_id].banned_until = 0
+    
+    def unban(self, vk_id: int):
+        """Разбанивает пользователя."""
+        with self._lock:
+            if vk_id in self._entries:
+                self._entries[vk_id].banned_until = 0
+                self._entries[vk_id].messages.clear()
+        self._db.unban_user_spam(vk_id)
 
-    # --- Если пользователя нет — создаём ---
-    if not user:
-        user = create_user(user_id, event.user_name if hasattr(event, 'user_name') else None)
-        give_xp(user_id, 10)  # значок «Новичок»
-        send_msg(user_id,
-            "Привет! 👋 Я «Навигатор успеха» — твой помощник в учёбе.\n\n"
-            "Я помогу с расписанием, ДЗ, объясню сложные темы и не дам ничего забыть!\n\n"
-            "В каком ты классе (5–9)? Напиши просто цифру."
+
+# =============================================================================
+# ОБРАБОТЧИК КОМАНД
+# =============================================================================
+
+class CommandHandler:
+    """
+    Обработчик команд бота (начинаются с символа ADMIN_COMMAND_PREFIX).
+    """
+    
+    def __init__(self, bot: "NavigatorBot"):
+        self.bot = bot
+        self._logger = get_logger()
+        self._commands: Dict[str, Any] = {}
+        self._admin_commands: Dict[str, Any] = {}
+        self._register_commands()
+    
+    def _register_commands(self):
+        """Регистрирует все команды."""
+        # Пользовательские команды
+        self._commands['help'] = self._cmd_help
+        self._commands['h'] = self._cmd_help
+        self._commands['stats'] = self._cmd_stats
+        self._commands['clear'] = self._cmd_clear
+        self._commands['about'] = self._cmd_about
+        self._commands['top'] = self._cmd_top
+        
+        # Админ-команды
+        self._admin_commands['users'] = self._admin_users
+        self._admin_commands['broadcast'] = self._admin_broadcast
+        self._admin_commands['ban'] = self._admin_ban
+        self._admin_commands['unban'] = self._admin_unban
+        self._admin_commands['health'] = self._admin_health
+        self._admin_commands['shutdown'] = self._admin_shutdown
+        self._admin_commands['errors'] = self._admin_errors
+        self._admin_commands['dbstats'] = self._admin_dbstats
+        self._admin_commands['promote'] = self._admin_promote
+    
+    def handle(self, user: UserInfo, text: str) -> Optional[str]:
+        """
+        Обрабатывает команду и возвращает ответ.
+        Возвращает None, если текст не является командой.
+        """
+        text = text.strip()
+        if not text.startswith(ADMIN_COMMAND_PREFIX):
+            return None
+        
+        # Парсим команду
+        parts = text[1:].split(maxsplit=1)
+        command = parts[0].lower() if parts else ""
+        args = parts[1].strip() if len(parts) > 1 else ""
+        
+        # Проверяем пользовательские команды
+        if command in self._commands:
+            return self._commands[command](user, args)
+        
+        # Проверяем админ-команды
+        if command in self._admin_commands:
+            if not user.is_admin:
+                return "❌ У вас нет прав для этой команды."
+            return self._admin_commands[command](user, args)
+        
+        return f"❓ Неизвестная команда. Введите !help для списка команд."
+    
+    # --- Пользовательские команды ---
+    
+    def _cmd_help(self, user: UserInfo, args: str) -> str:
+        return HELP_MESSAGE
+    
+    def _cmd_stats(self, user: UserInfo, args: str) -> str:
+        msg_count = self.bot.db.get_history_count(user.vk_id)
+        history_msgs = self.bot.db.get_history(user.vk_id, 1)
+        
+        result = (
+            f"📊 Ваша статистика:\n\n"
+            f"Имя: {user.full_name()}\n"
+            f"VK ID: {user.vk_id}\n"
+            f"Сообщений отправлено: {user.messages_count}\n"
+            f"Сообщений в истории: {msg_count}\n"
         )
-        return
-
-    # --- Если класс не выбран ---
-    if user["class_grade"] is None:
-        if text.isdigit() and 5 <= int(text) <= 9:
-            set_class(user_id, int(text))
-            send_msg(user_id,
-                f"Отлично! Теперь я подстрою объяснения под {text} класс. 🎯\n\n"
-                "Выбери, что хочешь сделать:",
-                keyboard=kb_main_menu()
-            )
-        else:
-            send_msg(user_id, "Напиши цифру от 5 до 9 — в каком ты классе? 😊")
-        return
-
-    state = user.get("state", "main")
-    state_data = user.get("state_data")
-
-    # --- Кнопка "Назад" ---
-    if text == "🔙 назад":
-        set_state(user_id, "main")
-        send_msg(user_id, "Возвращаемся в меню! 🏠", keyboard=kb_main_menu())
-        return
-
-    # --- Кнопка "Меню" ---
-    if text == "🏠 меню":
-        set_state(user_id, "main")
-        clear_quiz_session(user_id)
-        send_msg(user_id, "Главное меню! Выбирай: 👇", keyboard=kb_main_menu())
-        return
-
-    # --- Кнопка "/start" ---
-    if text == "/start" or text == "начать":
-        set_state(user_id, "main")
-        send_msg(user_id, "Главное меню! Выбирай: 👇", keyboard=kb_main_menu())
-        return
-
-    # ============================================================
-    #  РАЗДЕЛ: ЧТО СЕГОДНЯ?
-    # ============================================================
-    if text == "📅 что сегодня?":
-        today = datetime.now().weekday() + 1
-        lessons = get_user_schedule(user_id, today)
-        clubs = get_user_clubs(user_id, today)
-        load = len(lessons) + len(clubs)
-        text_resp = f"📅 План на сегодня ({DAYS.get(today, '?')}):\n\n"
-        text_resp += format_schedule_text(lessons, clubs)
-        text_resp += f"\n📊 Нагрузка: {format_load_emoji(load)}\n"
-        if load >= 7:
-            text_resp += "\n" + random.choice(ANTI_STRESS_PHRASES)
-        send_msg(user_id, text_resp, keyboard=kb_main_menu())
-        return
-
-    # ============================================================
-    #  РАЗДЕЛ: РАСПИСАНИЕ (кнопочный ввод)
-    # ============================================================
-    if text == "📋 расписание":
-        set_state(user_id, "schedule_menu")
-        send_msg(user_id, "📋 Управление расписанием:\n\nДобавляй уроки кнопками — день → время → предмет.",
-                 keyboard=kb_schedule_menu())
-        return
-
-    if state == "schedule_menu":
-        if text == "➕ добавить урок":
-            set_state(user_id, "schedule_day", "")
-            send_msg(user_id, "Выбери день недели:", keyboard=kb_days())
-            return
-
-        if text == "📋 моё расписание":
-            send_msg(user_id, format_full_schedule(user_id), keyboard=kb_schedule_menu())
-            return
-
-        if text == "❌ удалить урок":
-            lessons_all = get_user_schedule(user_id)
-            if not lessons_all:
-                send_msg(user_id, "Уроков пока нет — нечего удалять. 🤷", keyboard=kb_schedule_menu())
-                return
-            text_resp = "Список уроков (отправь ID для удаления):\n\n"
-            for l in lessons_all:
-                t = l["start_time"].strftime("%H:%M") if hasattr(l["start_time"], "strftime") else str(l["start_time"])
-                text_resp += f"🆔 {l['id']} | {DAYS[l['day_of_week']]} {t} — {l['subject']}\n"
-            set_state(user_id, "schedule_delete", "")
-            send_msg(user_id, text_resp, keyboard=kb_back_menu())
-            return
-
-    # --- Выбор дня для расписания ---
-    if state == "schedule_day" and text.startswith("day_"):
-        day_num = int(text.split("_")[1])
-        set_state(user_id, "schedule_time", str(day_num))
-        send_msg(user_id, f"День: {DAYS[day_num]}\nВыбери время урока:", keyboard=kb_lesson_times())
-        return
-
-    # --- Выбор времени для расписания ---
-    if state == "schedule_time" and text.startswith("time_"):
-        chosen_time = text.split("_", 1)[1]
-        day_num = int(state_data)
-        set_state(user_id, "schedule_subject", f"{day_num}|{chosen_time}")
-        send_msg(user_id, f"День: {DAYS[day_num]}, время: {chosen_time}\nВыбери предмет:", keyboard=kb_subjects())
-        return
-
-    # --- Выбор предмета ---
-    if state == "schedule_subject" and text.startswith("subj_"):
-        subject = text.split("_", 1)[1]
-        parts = state_data.split("|")
-        day_num = int(parts[0])
-        chosen_time = parts[1]
+        
+        if user.first_seen:
+            result += f"Регистрация: {user.first_seen.strftime('%Y-%m-%d %H:%M')}\n"
+        if user.last_seen:
+            result += f"Последняя активность: {user.last_seen.strftime('%Y-%m-%d %H:%M')}\n"
+        
+        result += f"Роль: {user.role}\n"
+        result += f"Статус: {user.status}\n"
+        
+        return result
+    
+    def _cmd_clear(self, user: UserInfo, args: str) -> str:
+        count = self.bot.db.clear_history(user.vk_id)
+        self.bot.db.deactivate_session(user.vk_id)
+        return f"🧹 История диалога очищена! Удалено сообщений: {count}"
+    
+    def _cmd_about(self, user: UserInfo, args: str) -> str:
+        return ABOUT_MESSAGE
+    
+    def _cmd_top(self, user: UserInfo, args: str) -> str:
+        top_users = self.bot.db.get_top_users(10)
+        if not top_users:
+            return "📊 Пока нет активных пользователей."
+        
+        lines = ["🏆 Топ активных пользователей:\n"]
+        for i, u in enumerate(top_users, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            lines.append(f"{medal} {u.full_name()} — {u.messages_count} сообщений")
+        
+        return "\n".join(lines)
+    
+    # --- Админ-команды ---
+    
+    def _admin_users(self, user: UserInfo, args: str) -> str:
+        """Список пользователей."""
         try:
-            add_lesson(user_id, day_num, subject, chosen_time)
-            result = give_xp(user_id, 10)
-            resp = f"✅ Урок добавлен!\n📚 {DAYS[day_num]} {chosen_time} — {subject}\n+10 XP! 🎉"
-            if result["leveled_up"]:
-                resp += f"\n\n🏆 Поздравляю! Ты достиг {result['level']} уровня!"
-            set_state(user_id, "schedule_menu")
-            send_msg(user_id, resp, keyboard=kb_schedule_menu())
-        except psycopg2.errors.UniqueViolation:
-            set_state(user_id, "schedule_menu")
-            send_msg(user_id, "❌ На это время уже есть урок! Выбери другое.", keyboard=kb_schedule_menu())
-        return
+            limit = int(args) if args else 20
+        except ValueError:
+            limit = 20
+        limit = min(limit, 100)
+        
+        users = self.bot.db.get_all_users(limit=limit)
+        if not users:
+            return "👥 Пользователей пока нет."
+        
+        lines = [f"👥 Последние {len(users)} пользователей:\n"]
+        for u in users:
+            status_icon = "✅" if u.status == "active" else "❌" if u.status == "banned" else "⏸"
+            lines.append(f"{status_icon} {u.full_name()} (ID: {u.vk_id}) — {u.messages_count} сообщ.")
+        
+        total = self.bot.db.get_total_users()
+        lines.append(f"\nВсего пользователей: {total}")
+        return "\n".join(lines)
+    
+    def _admin_broadcast(self, user: UserInfo, args: str) -> str:
+        """Рассылка всем пользователям."""
+        if not args:
+            return "Использование: !broadcast текст сообщения"
+        
+        all_users = self.bot.db.get_all_users(limit=10000)
+        sent = 0
+        failed = 0
+        
+        for u in all_users:
+            if u.status == "active":
+                if self.bot.vk.send_message(u.vk_id, f"📢 Рассылка:\n\n{args}"):
+                    sent += 1
+                else:
+                    failed += 1
+                time.sleep(0.05)  # Не спамим VK API
+        
+        return f"📢 Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}"
+    
+    def _admin_ban(self, user: UserInfo, args: str) -> str:
+        """Бан пользователя по VK ID."""
+        try:
+            target_id = int(args.split()[0]) if args else 0
+        except ValueError:
+            return "Использование: !ban VK_ID"
+        
+        if not target_id:
+            return "Использование: !ban VK_ID"
+        
+        self.bot.db.update_user_status(target_id, UserStatus.BANNED.value)
+        self.bot.antispam.ban_user_spam(target_id, f"Забанен админом {user.vk_id}")
+        return f"🚫 Пользователь {target_id} заблокирован."
+    
+    def _admin_unban(self, user: UserInfo, args: str) -> str:
+        """Разбан пользователя."""
+        try:
+            target_id = int(args.split()[0]) if args else 0
+        except ValueError:
+            return "Использование: !unban VK_ID"
+        
+        if not target_id:
+            return "Использование: !unban VK_ID"
+        
+        self.bot.db.update_user_status(target_id, UserStatus.ACTIVE.value)
+        self.bot.antispam.unban(target_id)
+        return f"✅ Пользователь {target_id} разблокирован."
+    
+    def _admin_health(self, user: UserInfo, args: str) -> str:
+        """Проверка здоровья системы."""
+        db_ok = self.bot.db.is_connected
+        vk_ok = self.bot.vk.is_connected
+        gc_ok = self.bot.gigachat.is_connected
+        
+        lines = ["🏥 Проверка здоровья системы:\n"]
+        lines.append(f"БД PostgreSQL: {'✅ Работает' if db_ok else '❌ Оффлайн'}")
+        lines.append(f"VK API: {'✅ Работает' if vk_ok else '❌ Оффлайн'}")
+        lines.append(f"GigaChat: {'✅ Работает' if gc_ok else '❌ Оффлайн' if self.bot.config.enable_gigachat else '⏸ Отключён'}")
+        lines.append(f"Бот работает: {self.bot.stats.uptime_str()}")
+        lines.append(f"Состояние: {self.bot.state.name}")
+        
+        lines.append(f"\n--- Статистика ---")
+        lines.append(f"Получено сообщений: {self.bot.stats.total_messages_received}")
+        lines.append(f"Отправлено сообщений: {self.bot.stats.total_messages_sent}")
+        lines.append(f"Вызовов GigaChat: {self.bot.gigachat.call_count}")
+        lines.append(f"Ошибок GigaChat: {self.bot.gigachat.error_count}")
+        lines.append(f"Заблокировано спама: {self.bot.stats.total_spam_blocked}")
+        lines.append(f"Всего ошибок: {self.bot.stats.total_errors}")
+        
+        return "\n".join(lines)
+    
+    def _admin_shutdown(self, user: UserInfo, args: str) -> str:
+        """Остановка бота."""
+        self.bot.request_shutdown()
+        return "👋 Бот останавливается..."
+    
+    def _admin_errors(self, user: UserInfo, args: str) -> str:
+        """Последние ошибки из БД."""
+        errors = self.bot.db.get_recent_errors(10)
+        if not errors:
+            return "✅ Ошибок в логе БД нет!"
+        
+        lines = ["📋 Последние ошибки:\n"]
+        for err in errors:
+            err_type = err.get('error_type', 'Unknown')
+            err_msg = err.get('error_message', '')[:100]
+            err_time = err.get('created_at', '')
+            lines.append(f"[{err_time}] {err_type}: {err_msg}")
+        
+        return "\n".join(lines)
+    
+    def _admin_dbstats(self, user: UserInfo, args: str) -> str:
+        """Статистика БД."""
+        stats = self.bot.db.get_stats_summary()
+        lines = ["📊 Статистика БД:\n"]
+        lines.append(f"Всего пользователей: {stats.get('total_users', 0)}")
+        lines.append(f"Активных пользователей: {stats.get('active_users', 0)}")
+        lines.append(f"Всего сообщений: {stats.get('total_messages', 0)}")
+        lines.append(f"Активных сессий: {stats.get('total_sessions', 0)}")
+        return "\n".join(lines)
+    
+    def _admin_promote(self, user: UserInfo, args: str) -> str:
+        """Повышение пользователя до админа."""
+        try:
+            target_id = int(args.split()[0]) if args else 0
+        except ValueError:
+            return "Использование: !promote VK_ID"
+        
+        if not target_id:
+            return "Использование: !promote VK_ID"
+        
+        self.bot.db.update_user_role(target_id, UserRole.ADMIN.value)
+        return f"⭐ Пользователь {target_id} повышен до админа."
 
-    # --- Удаление урока ---
-    if state == "schedule_delete" and text.isdigit():
-        lesson_id = int(text)
-        if delete_lesson(user_id, lesson_id):
-            send_msg(user_id, f"✅ Урок с ID {lesson_id} удалён!", keyboard=kb_schedule_menu())
+
+# =============================================================================
+# ГЛАВНЫЙ КЛАСС БОТА
+# =============================================================================
+
+class NavigatorBot:
+    """
+    Главный класс бота «Навигатор Успеха».
+    Объединяет все компоненты и управляет жизненным циклом.
+    """
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self._logger = get_logger()
+        self._state = BotState.STOPPED
+        self._shutdown_event = threading.Event()
+        self._lock = threading.Lock()
+        
+        # Инициализация компонентов
+        self.db: Optional[DatabaseManager] = None
+        self.vk: Optional[VKManager] = None
+        self.gigachat: Optional[GigaChatManager] = None
+        self.antispam: Optional[AntispamSystem] = None
+        self.command_handler: Optional[CommandHandler] = None
+        
+        # Статистика
+        self.stats = BotStats()
+        
+        # Очередь сообщений
+        self._message_queue: queue.Queue = queue.Queue(maxsize=1000)
+        
+        # Потоки
+        self._poll_thread: Optional[threading.Thread] = None
+        self._worker_threads: List[threading.Thread] = []
+        self._health_thread: Optional[threading.Thread] = None
+        self._stats_thread: Optional[threading.Thread] = None
+    
+    @property
+    def state(self) -> BotState:
+        return self._state
+    
+    # --- Инициализация ---
+    
+    def initialize(self) -> bool:
+        """Инициализирует все компоненты бота."""
+        self._state = BotState.STARTING
+        self._logger.info(f"{'='*60}")
+        self._logger.info(f"  {BOT_NAME} v{BOT_VERSION} — Запуск инициализации...")
+        self._logger.info(f"{'='*60}")
+        
+        # Проверка конфигурации
+        config_errors = self.config.validate()
+        if config_errors:
+            self._logger.error("Ошибки конфигурации:")
+            for err in config_errors:
+                self._logger.error(f"  - {err}")
+            self._state = BotState.ERROR
+            return False
+        
+        self._logger.info("✅ Конфигурация проверена.")
+        
+        # 1. Инициализация БД
+        self.db = DatabaseManager.get_instance(self.config)
+        if not self.db.connect():
+            self._logger.error("Не удалось подключиться к БД!")
+            self._state = BotState.ERROR
+            return False
+        
+        # Создаём таблицы
+        try:
+            self.db.init_tables()
+        except Exception as e:
+            self._logger.error(f"Ошибка создания таблиц: {e}")
+            self._state = BotState.ERROR
+            return False
+        
+        # 2. Инициализация VK API
+        self.vk = VKManager(self.config)
+        if not self.vk.connect():
+            self._logger.error("Не удалось подключиться к VK API!")
+            self._state = BotState.ERROR
+            return False
+        
+        if not self.vk.init_longpoll():
+            self._logger.error("Не удалось инициализировать Long Polling!")
+            self._state = BotState.ERROR
+            return False
+        
+        # 3. Инициализация GigaChat
+        self.gigachat = GigaChatManager(self.config)
+        if self.config.enable_gigachat:
+            if not self.gigachat.authenticate():
+                self._logger.warning("GigaChat недоступен. Бот будет работать в режиме без ИИ.")
         else:
-            send_msg(user_id, "❌ Не найден урок с таким ID.", keyboard=kb_schedule_menu())
-        set_state(user_id, "schedule_menu")
-        return
-
-    # ============================================================
-    #  РАЗДЕЛ: КРУЖКИ (кнопочный ввод)
-    # ============================================================
-    if text == "🎯 кружки":
-        set_state(user_id, "clubs_menu")
-        send_msg(user_id, "🎯 Управление кружками:\n\nДобавляй кружки кнопками — день → время → название.",
-                 keyboard=kb_clubs_menu())
-        return
-
-    if state == "clubs_menu":
-        if text == "➕ добавить кружок":
-            set_state(user_id, "club_day", "")
-            send_msg(user_id, "Выбери день недели для кружка:", keyboard=kb_days())
+            self._logger.info("GigaChat отключён в конфигурации.")
+        
+        # 4. Инициализация анти-спама
+        self.antispam = AntispamSystem(self.db, self.config.enable_antispam)
+        
+        # 5. Инициализация обработчика команд
+        self.command_handler = CommandHandler(self)
+        
+        # 6. Загружаем статистику из БД
+        self.stats.total_users = self.db.get_total_users()
+        self._logger.info(f"Пользователей в БД: {self.stats.total_users}")
+        
+        # 7. Очистка истекших банов
+        self.db.clean_expired_bans()
+        
+        self._logger.info(f"{'='*60}")
+        self._logger.info(f"  {BOT_NAME} — Инициализация завершена!")
+        self._logger.info(f"  Группа: «{self.vk.group_name}» (ID: {self.vk.group_id})")
+        self._logger.info(f"  БД: {self.config.db_name}@{self.config.db_host}")
+        self._logger.info(f"  GigaChat: {'Включён' if self.gigachat.is_connected else 'Отключён'}")
+        self._logger.info(f"  Анти-спам: {'Включён' if self.config.enable_antispam else 'Отключён'}")
+        self._logger.info(f"{'='*60}")
+        
+        return True
+    
+    # --- Запуск ---
+    
+    def start(self):
+        """Запускает бота."""
+        if not self.initialize():
+            self._logger.error("Инициализация провалилась! Бот не запущен.")
             return
-
-        if text == "📋 мои кружки":
-            send_msg(user_id, format_full_clubs(user_id), keyboard=kb_clubs_menu())
-            return
-
-        if text == "❌ удалить кружок":
-            clubs_all = get_user_clubs(user_id)
-            if not clubs_all:
-                send_msg(user_id, "Кружков пока нет — нечего удалять. 🤷", keyboard=kb_clubs_menu())
+        
+        self._state = BotState.RUNNING
+        self.stats.start_time = datetime.datetime.now()
+        
+        self._logger.info(f"🚀 {BOT_NAME} запущен и готов к работе!")
+        
+        # Запуск потоков
+        self._start_polling()
+        self._start_workers()
+        self._start_health_check()
+        self._start_stats_dump()
+        
+        # Ждём сигнала остановки
+        try:
+            while not self._shutdown_event.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            self._logger.info("Получен сигнал прерывания (Ctrl+C)")
+            self.request_shutdown()
+        
+        self._wait_for_threads()
+        self._cleanup()
+        
+        self._logger.info(f"👋 {BOT_NAME} остановлен. Время работы: {self.stats.uptime_str()}")
+    
+    def _start_polling(self):
+        """Запускает поток получения событий от VK."""
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True, name="VK-Poller")
+        self._poll_thread.start()
+        self._logger.info("Поток polling запущен.")
+    
+    def _start_workers(self, num_workers: int = 3):
+        """Запускает рабочие потоки для обработки сообщений."""
+        for i in range(num_workers):
+            t = threading.Thread(target=self._worker_loop, daemon=True, name=f"Worker-{i+1}")
+            t.start()
+            self._worker_threads.append(t)
+        self._logger.info(f"Запущено {num_workers} рабочих потоков.")
+    
+    def _start_health_check(self):
+        """Запускает поток периодической проверки здоровья."""
+        self._health_thread = threading.Thread(target=self._health_loop, daemon=True, name="Health-Check")
+        self._health_thread.start()
+        self._logger.info("Поток health-check запущен.")
+    
+    def _start_stats_dump(self):
+        """Запускает поток периодического дампа статистики."""
+        self._stats_thread = threading.Thread(target=self._stats_loop, daemon=True, name="Stats-Dump")
+        self._stats_thread.start()
+        self._logger.info("Поток статистики запущен.")
+    
+    # --- Основные циклы ---
+    
+    def _poll_loop(self):
+        """Цикл получения событий от VK Long Polling."""
+        self._logger.info("Polling loop запущен.")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                if self.vk._vk_longpoll:
+                    # Используем библиотечный Long Polling
+                    for event in self.vk._vk_longpoll.listen():
+                        if self._shutdown_event.is_set():
+                            break
+                        self._process_vk_event(event)
+                else:
+                    # Ручной Long Polling
+                    events = self.vk.get_longpoll_events()
+                    for event in events:
+                        if self._shutdown_event.is_set():
+                            break
+                        self._process_raw_event(event)
+                    
+                    if not events:
+                        time.sleep(0.1)
+                        
+            except Exception as e:
+                self._logger.error(f"Ошибка в poll loop: {e}")
+                self._logger.debug(traceback.format_exc())
+                time.sleep(1)
+        
+        self._logger.info("Polling loop остановлен.")
+    
+    def _process_vk_event(self, event):
+        """Обрабатывает событие из библиотечного Long Polling."""
+        try:
+            # Проверяем, что это новое сообщение
+            if hasattr(event, 'type') and event.type == vk_api.bot_longpoll.VkBotEventType.MESSAGE_NEW:
+                msg_data = event.obj.get('message', event.obj)
+                self._handle_incoming_message(msg_data)
+        except Exception as e:
+            self._logger.error(f"Ошибка обработки события VK: {e}")
+    
+    def _process_raw_event(self, event: Dict):
+        """Обрабатывает событие из ручного Long Polling."""
+        try:
+            if event.get('type') == 'message_new':
+                msg_data = event.get('object', {}).get('message', {})
+                if msg_data:
+                    self._handle_incoming_message(msg_data)
+        except Exception as e:
+            self._logger.error(f"Ошибка обработки raw-события: {e}")
+    
+    def _handle_incoming_message(self, msg_data: Dict):
+        """Обрабатывает входящее сообщение и ставит его в очередь."""
+        try:
+            user_id = msg_data.get('from_id') or msg_data.get('user_id', 0)
+            text = msg_data.get('text', '').strip()
+            msg_id = msg_data.get('conversation_message_id') or msg_data.get('id', 0)
+            
+            if not user_id or not text:
                 return
-            text_resp = "Список кружков (отправь ID для удаления):\n\n"
-            for c in clubs_all:
-                t = c["start_time"].strftime("%H:%M") if hasattr(c["start_time"], "strftime") else str(c["start_time"])
-                text_resp += f"🆔 {c['id']} | {DAYS[c['day_of_week']]} {t} — {c['name']}\n"
-            set_state(user_id, "club_delete", "")
-            send_msg(user_id, text_resp, keyboard=kb_back_menu())
-            return
-
-    # --- Выбор дня для кружка ---
-    if state == "club_day" and text.startswith("day_"):
-        day_num = int(text.split("_")[1])
-        set_state(user_id, "club_time", str(day_num))
-        send_msg(user_id, f"День: {DAYS[day_num]}\nВыбери время кружка:", keyboard=kb_club_times())
-        return
-
-    # --- Выбор времени для кружка ---
-    if state == "club_time" and text.startswith("ctime_"):
-        chosen_time = text.split("_", 1)[1]
-        day_num = int(state_data)
-        set_state(user_id, "club_name", f"{day_num}|{chosen_time}")
-        send_msg(user_id,
-            f"День: {DAYS[day_num]}, время: {chosen_time}\n"
-            "Напиши название кружка (например, «Футбол»):",
-            keyboard=kb_back()
-        )
-        return
-
-    # --- Ввод названия кружка ---
-    if state == "club_name" and not text.startswith(("🔙", "🏠", "day_", "time_", "ctime_", "subj_", "quiz_")):
-        parts = state_data.split("|")
-        day_num = int(parts[0])
-        chosen_time = parts[1]
-        club_name = raw_text.strip()
-        if len(club_name) < 2:
-            send_msg(user_id, "Название слишком короткое. Попробуй ещё раз:")
-            return
-        add_club(user_id, club_name, day_num, chosen_time)
-        result = give_xp(user_id, 10)
-        resp = f"✅ Кружок добавлен!\n🎯 {DAYS[day_num]} {chosen_time} — {club_name}\n+10 XP! 🎉"
-        if result["leveled_up"]:
-            resp += f"\n\n🏆 Поздравляю! Ты достиг {result['level']} уровня!"
-        set_state(user_id, "clubs_menu")
-        send_msg(user_id, resp, keyboard=kb_clubs_menu())
-        return
-
-    # --- Удаление кружка ---
-    if state == "club_delete" and text.isdigit():
-        club_id = int(text)
-        if delete_club(user_id, club_id):
-            send_msg(user_id, f"✅ Кружок с ID {club_id} удалён!", keyboard=kb_clubs_menu())
-        else:
-            send_msg(user_id, "❌ Не найден кружок с таким ID.", keyboard=kb_clubs_menu())
-        set_state(user_id, "clubs_menu")
-        return
-
-    # ============================================================
-    #  РАЗДЕЛ: ИИ-ТЬЮТОР (GigaChat)
-    # ============================================================
-    if text == "📚 ии-тьютор":
-        set_state(user_id, "ai_tutor", "")
-        send_msg(user_id,
-            "🧠 Напиши тему, которую не понял (например, «дроби», «Past Simple», «фотосинтез»).\n"
-            "Я объясню простыми словами и задам проверочный вопрос!"
-        )
-        return
-
-    if state == "ai_tutor" and not text.startswith(("🔙", "🏠", "day_", "time_", "ctime_", "subj_", "quiz_", "📋", "🎒", "🔔", "📊", "🔗", "🎯", "🤝", "📅", "➕", "❌", "🔄", "📋")):
-        topic = raw_text.strip()
-        if len(topic) < 2:
-            send_msg(user_id, "Тема слишком короткая. Попробуй ещё раз:")
-            return
-        send_typing(user_id)
-        send_msg(user_id, "Думаю над объяснением… 🧠")
-        response = call_gigachat(topic, user["class_grade"])
-        if response:
-            explanation = response.get("explanation", "")
-            question = response.get("question", "")
-            options = response.get("options", {})
-            correct = response.get("correct", "")
-            text_resp = f"📝 Тема: «{topic}»\n\n{explanation}\n\n"
-            text_resp += f"❓ Проверочный вопрос:\n{question}\n\n"
-            if options:
-                for key in sorted(options.keys()):
-                    text_resp += f"  {key}) {options[key]}\n"
-                save_quiz_session(user_id, correct, topic)
-                send_msg(user_id, text_resp, keyboard=kb_quiz_options(options))
-            else:
-                text_resp += "\n(Варианты ответа не сгенерированы. Попробуй другую тему!)"
-                send_msg(user_id, text_resp, keyboard=kb_main_menu())
-        else:
-            send_msg(user_id,
-                "Прости, не получилось подключиться к ИИ. 😞\n"
-                "Загляни в раздел «🔗 Учёба» — там есть ссылки на видеоуроки и материалы!",
-                keyboard=kb_main_menu()
-            )
-        set_state(user_id, "main")
-        return
-
-    # --- Проверка ответа квиза ---
-    if text.startswith("quiz_"):
-        answer = text.split("_", 1)[1]
-        session = get_quiz_session(user_id)
-        if session:
-            correct = session["correct_answer"]
-            topic = session["topic"]
-            if answer == correct:
-                result = give_xp(user_id, 30)
-                resp = f"✅ Правильно! Молодец! 🎉\n+30 XP!"
-                # Увеличиваем счётчик правильных ответов
-                with get_db_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("UPDATE users SET correct_ai_answers = correct_ai_answers + 1 WHERE vk_id = %s", (user_id,))
-                        conn.commit()
-                if result["leveled_up"]:
-                    resp += f"\n\n🏆 Ты достиг {result['level']} уровня!"
-                u = get_user(user_id)
-                if u.get("correct_ai_answers", 0) >= 5:
-                    resp += "\n\n🏅 Значок: «Знаток» (5 правильных ответов)!"
-            else:
-                resp = f"❌ Почти! Правильный ответ: {correct}.\n\nНе переживай — ошибки помогают учиться! 💪\nМожешь попробовать другую тему в «📚 ИИ-тьютор»."
-            clear_quiz_session(user_id)
-            send_msg(user_id, resp, keyboard=kb_main_menu())
-        else:
-            send_msg(user_id, "Сессия истекла. Попробуй задать тему заново в «📚 ИИ-тьютор».", keyboard=kb_main_menu())
-        return
-
-    # ============================================================
-    #  РАЗДЕЛ: ДЗ
-    # ============================================================
-    if text == "🎒 дз":
-        set_state(user_id, "hw_menu")
-        send_msg(user_id,
-            "🎒 Управление ДЗ:\n\n"
-            "• «➕ Добавить ДЗ» — добавь задание (предмет | описание | дата ГГГГ-ММ-ДД)\n"
-            "• «📋 Мои ДЗ» — список невыполненных\n"
-            "• Чтобы отметить выполненным, отправь ID из списка.",
-            keyboard=kb_hw_menu()
-        )
-        return
-
-    if state == "hw_menu":
-        if text == "➕ добавить дз":
-            set_state(user_id, "hw_add", "")
-            send_msg(user_id,
-                "Отправь в одном сообщении:\n"
-                "Предмет | Описание | Дата (ГГГГ-ММ-ДД)\n\n"
-                "Пример: Математика | Упр. 12, стр. 45 | 2024-10-25",
-                keyboard=kb_back_menu()
-            )
-            return
-
-        if text == "📋 мои дз":
-            hw_list = get_pending_hw(user_id)
-            if not hw_list:
-                send_msg(user_id, "🎉 Нет невыполненных ДЗ! Ты молодец! 🌟", keyboard=kb_hw_menu())
-            else:
-                text_resp = "📋 Невыполненные ДЗ:\n\n"
-                for hw in hw_list:
-                    due = hw["due_date"].strftime("%d.%m.%Y") if hasattr(hw["due_date"], "strftime") else str(hw["due_date"])
-                    text_resp += f"🆔 {hw['id']} | 📘 {hw['subject']}\n📝 {hw['description']}\n🗓 До: {due}\n\n"
-                text_resp += "Отправь ID, чтобы отметить как выполненное."
-                send_msg(user_id, text_resp, keyboard=kb_hw_menu())
-            return
-
-    if state == "hw_add" and "|" in raw_text:
-        parts = [p.strip() for p in raw_text.split("|")]
-        if len(parts) == 3:
-            subject, description, due_date = parts
+            
+            # Помещаем в очередь
             try:
-                datetime.strptime(due_date, "%Y-%m-%d")
-                add_homework(user_id, subject, description, due_date)
-                result = give_xp(user_id, 10)
-                resp = f"✅ ДЗ добавлено!\n📘 {subject} — {description}\n🗓 До: {due_date}\n+10 XP! 🎉"
-                if result["leveled_up"]:
-                    resp += f"\n\n🏆 Ты достиг {result['level']} уровня!"
-                set_state(user_id, "hw_menu")
-                send_msg(user_id, resp, keyboard=kb_hw_menu())
-            except ValueError:
-                send_msg(user_id, "❌ Неверный формат даты. Используй ГГГГ-ММ-ДД (например, 2024-10-25).")
-            return
-
-    # Отметка ДЗ выполненным (по ID)
-    if state == "hw_menu" and text.isdigit():
-        hw_id = int(text)
-        if mark_hw_done(user_id, hw_id):
-            result = give_xp(user_id, 20)
-            update_streak(user_id)
-            resp = f"✅ ДЗ с ID {hw_id} отмечено выполненным!\n+20 XP! 🎉"
-            if result["leveled_up"]:
-                resp += f"\n\n🏆 Ты достиг {result['level']} уровня!"
-            send_msg(user_id, resp, keyboard=kb_hw_menu())
-        else:
-            send_msg(user_id, "❌ Не найдено ДЗ с таким ID. Проверь список «📋 Мои ДЗ».", keyboard=kb_hw_menu())
-        return
-
-    # ============================================================
-    #  РАЗДЕЛ: НАПОМИНАНИЯ
-    # ============================================================
-    if text == "🔔 напоминания":
-        set_state(user_id, "reminders_menu")
-        send_msg(user_id,
-            "🔔 Напоминания:\n\n"
-            "• «➕ Добавить» — текст | дата и время (ГГГГ-ММ-ДД ЧЧ:ММ)\n"
-            "• «📋 Сегодня» — напоминания на сегодня\n"
-            "• «📋 Все» — все активные\n"
-            "• «❌ Удалить» — отправь ID\n"
-            "• «🔄 Вкл/Выкл» — переключить активность",
-            keyboard=kb_reminders_menu()
-        )
-        return
-
-    if state == "reminders_menu":
-        if text == "➕ добавить":
-            set_state(user_id, "reminder_add", "")
-            send_msg(user_id,
-                "Отправь: Текст | ГГГГ-ММ-ДД ЧЧ:ММ\n"
-                "Пример: Купить тетрадь | 2024-10-25 15:00",
-                keyboard=kb_back_menu()
-            )
-            return
-
-        if text == "📋 сегодня":
-            rems = get_today_reminders(user_id)
-            if not rems:
-                send_msg(user_id, "На сегодня нет напоминаний. 🎉", keyboard=kb_reminders_menu())
-            else:
-                text_resp = "🔔 Напоминания на сегодня:\n\n"
-                for r in rems:
-                    t = r["trigger_time"].strftime("%H:%M") if hasattr(r["trigger_time"], "strftime") else str(r["trigger_time"])
-                    text_resp += f"🆔 {r['id']} | ⏰ {t} | {'✅' if r['is_active'] else '⏸'} {r['text']}\n"
-                send_msg(user_id, text_resp, keyboard=kb_reminders_menu())
-            return
-
-        if text == "📋 все":
-            rems = get_active_reminders(user_id)
-            if not rems:
-                send_msg(user_id, "Нет активных напоминаний. 🎉", keyboard=kb_reminders_menu())
-            else:
-                text_resp = "🔔 Все напоминания:\n\n"
-                for r in rems:
-                    t = r["trigger_time"].strftime("%d.%m %H:%M") if hasattr(r["trigger_time"], "strftime") else str(r["trigger_time"])
-                    text_resp += f"🆔 {r['id']} | ⏰ {t} | {'✅' if r['is_active'] else '⏸'} {r['text']}\n"
-                send_msg(user_id, text_resp, keyboard=kb_reminders_menu())
-            return
-
-        if text == "❌ удалить":
-            rems = get_active_reminders(user_id)
-            if not rems:
-                send_msg(user_id, "Нечего удалять. 🤷", keyboard=kb_reminders_menu())
-            else:
-                text_resp = "Отправь ID напоминания для удаления:\n\n"
-                for r in rems:
-                    t = r["trigger_time"].strftime("%d.%m %H:%M") if hasattr(r["trigger_time"], "strftime") else str(r["trigger_time"])
-                    text_resp += f"🆔 {r['id']} | {t} | {r['text']}\n"
-                set_state(user_id, "reminder_delete", "")
-                send_msg(user_id, text_resp, keyboard=kb_back_menu())
-            return
-
-        if text == "🔄 вкл/выкл":
-            rems = get_active_reminders(user_id)
-            inactive_rems = []
-            with get_db_conn() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT * FROM reminders WHERE vk_id = %s AND is_active = FALSE ORDER BY trigger_time", (user_id,))
-                    inactive_rems = cur.fetchall()
-            all_rems = rems + inactive_rems
-            if not all_rems:
-                send_msg(user_id, "Нет напоминаний для переключения. 🤷", keyboard=kb_reminders_menu())
-            else:
-                text_resp = "Отправь ID напоминания для вкл/выкл:\n\n"
-                for r in all_rems:
-                    t = r["trigger_time"].strftime("%d.%m %H:%M") if hasattr(r["trigger_time"], "strftime") else str(r["trigger_time"])
-                    status = "✅ вкл" if r["is_active"] else "⏸ выкл"
-                    text_resp += f"🆔 {r['id']} | {status} | {t} | {r['text']}\n"
-                set_state(user_id, "reminder_toggle", "")
-                send_msg(user_id, text_resp, keyboard=kb_back_menu())
-            return
-
-    if state == "reminder_add" and "|" in raw_text:
-        parts = [p.strip() for p in raw_text.split("|")]
-        if len(parts) == 2:
-            rem_text, rem_time_str = parts
+                self._message_queue.put_nowait({
+                    'user_id': user_id,
+                    'text': text,
+                    'msg_id': msg_id,
+                    'timestamp': time.time()
+                })
+            except queue.Full:
+                self._logger.warning("Очередь сообщений переполнена! Пропускаю сообщение.")
+                
+        except Exception as e:
+            self._logger.error(f"Ошибка помещения сообщения в очередь: {e}")
+    
+    def _worker_loop(self):
+        """Цикл рабочего потока — берёт сообщения из очереди и обрабатывает."""
+        thread_name = threading.current_thread().name
+        self._logger.info(f"{thread_name}: запущен.")
+        
+        while not self._shutdown_event.is_set():
             try:
-                trigger_time = datetime.strptime(rem_time_str, "%Y-%m-%d %H:%M")
-                add_reminder(user_id, rem_text, trigger_time)
-                set_state(user_id, "reminders_menu")
-                send_msg(user_id,
-                    f"✅ Напоминание добавлено!\n🔔 «{rem_text}» на {rem_time_str}",
-                    keyboard=kb_reminders_menu()
+                msg_item = self._message_queue.get(timeout=1)
+                if msg_item:
+                    self._process_message(msg_item)
+                    self._message_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self._logger.error(f"{thread_name}: ошибка обработки: {e}")
+                self._logger.debug(traceback.format_exc())
+        
+        self._logger.info(f"{thread_name}: остановлен.")
+    
+    def _process_message(self, msg_item: Dict):
+        """
+        Основная обработка сообщения.
+        Здесь происходит вся логика: регистрация, команды, GigaChat.
+        """
+        user_id = msg_item['user_id']
+        text = msg_item['text']
+        
+        self.stats.total_messages_received += 1
+        
+        try:
+            # 1. Получаем информацию о пользователе из VK
+            vk_user_info = self.vk.get_user_info(user_id)
+            
+            # 2. Регистрируем/обновляем пользователя в БД
+            user = self.db.get_or_create_user(
+                vk_id=user_id,
+                username=vk_user_info.get('username', ''),
+                first_name=vk_user_info.get('first_name', ''),
+                last_name=vk_user_info.get('last_name', '')
+            )
+            
+            # Проверяем, является ли пользователь админом
+            if user_id in self.config.admin_ids:
+                user.is_admin = True
+                if user.role != UserRole.ADMIN.value:
+                    self.db.update_user_role(user_id, UserRole.ADMIN.value)
+            
+            # 3. Проверяем статус пользователя
+            if user.status == UserStatus.BANNED.value:
+                self.vk.send_message(user_id, "🚫 Вы заблокированы.")
+                return
+            
+            # 4. Анти-спам проверка
+            allowed, reason = self.antispam.check(user_id)
+            if not allowed:
+                self.stats.total_spam_blocked += 1
+                self.vk.send_message(user_id, reason)
+                return
+            
+            # 5. Обработка команд
+            if text.startswith(ADMIN_COMMAND_PREFIX):
+                response = self.command_handler.handle(user, text)
+                if response:
+                    self.vk.send_message(user_id, response)
+                    self.stats.total_messages_sent += 1
+                return
+            
+            # 6. Обычное сообщение — отправляем в GigaChat
+            self._handle_chat_message(user, text)
+            
+        except Exception as e:
+            self.stats.total_errors += 1
+            self.stats.last_error = str(e)
+            self.stats.last_error_time = datetime.datetime.now()
+            self._logger.error(f"Ошибка обработки сообщения от {user_id}: {e}")
+            self._logger.debug(traceback.format_exc())
+            
+            # Записываем ошибку в БД
+            self.db.log_error(
+                error_type=type(e).__name__,
+                error_message=str(e),
+                stack_trace=traceback.format_exc(),
+                vk_id=user_id
+            )
+            
+            # Уведомляем пользователя
+            try:
+                self.vk.send_message(user_id, "😔 Произошла ошибка при обработке сообщения. Попробуйте позже.")
+            except Exception:
+                pass
+    
+    def _handle_chat_message(self, user: UserInfo, text: str):
+        """Обрабатывает обычное сообщение через GigaChat."""
+        # Увеличиваем счётчик сообщений
+        self.db.increment_user_messages(user.vk_id)
+        user.messages_count += 1
+        
+        # Сохраняем сообщение пользователя в историю
+        self.db.add_message(user.vk_id, MessageType.USER.value, text)
+        
+        # Получаем сессию
+        session_uuid = self.db.get_or_create_session(user.vk_id)
+        
+        # Проверяем, доступен ли GigaChat
+        if not self.gigachat or not self.gigachat.is_connected:
+            # Пытаемся переподключиться
+            if self.config.enable_gigachat:
+                self._logger.info("Попытка переподключения к GigaChat...")
+                self.gigachat.authenticate()
+            
+            if not self.gigachat.is_connected:
+                fallback = self._get_fallback_response(text)
+                self.db.add_message(user.vk_id, MessageType.ASSISTANT.value, fallback)
+                self.vk.send_message(user.vk_id, fallback)
+                self.stats.total_messages_sent += 1
+                return
+        
+        # Отправляем индикатор "печатает..."
+        self.vk.send_typing(user.vk_id)
+        
+        # Получаем историю диалога
+        history = self.db.get_history(user.vk_id, self.config.max_history)
+        
+        # Формируем сообщения для GigaChat
+        chat_messages = []
+        for msg in history:
+            chat_messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+        
+        # Отправляем запрос к GigaChat
+        self._logger.debug(f"GigaChat запрос от {user.vk_id} ({len(chat_messages)} сообщений в контексте)")
+        
+        response_text = self.gigachat.chat(
+            messages=chat_messages,
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        if not response_text:
+            response_text = self._get_fallback_response(text)
+        
+        # Сохраняем ответ в историю
+        self.db.add_message(user.vk_id, MessageType.ASSISTANT.value, response_text)
+        
+        # Отправляем ответ пользователю
+        if self.vk.send_message(user.vk_id, response_text):
+            self.stats.total_messages_sent += 1
+            self.stats.total_gigachat_calls += 1
+        else:
+            self._logger.error(f"Не удалось отправить ответ пользователю {user.vk_id}")
+            self.stats.total_errors += 1
+    
+    def _get_fallback_response(self, text: str) -> str:
+        """Возвращает запасной ответ, когда GigaChat недоступен."""
+        fallbacks = [
+            "К сожалению, сервис ИИ временно недоступен. Но я всё равно здесь! "
+            "Попробуйте переформулировать вопрос или напишите позже. 🙏",
+            
+            "Сейчас я не могу подключиться к нейросети, но вот что я могу сказать: "
+            "каждый шаг к цели важен, даже маленький. Что вы хотите обсудить? 💪",
+            
+            "ИИ-сервис на техническом перерыве. А пока — вот совет дня: "
+            "начните с малого, но начните сегодня! 🚀",
+            
+            "Прошу прощения, нейросеть недоступна. Но вы можете использовать команды "
+            "!help, !stats или !about, пока мы восстанавливаем работу. 🔧"
+        ]
+        return random.choice(fallbacks)
+    
+    # --- Health check и статистика ---
+    
+    def _health_loop(self):
+        """Периодическая проверка здоровья системы."""
+        while not self._shutdown_event.is_set():
+            try:
+                self._shutdown_event.wait(HEALTH_CHECK_INTERVAL)
+                if self._shutdown_event.is_set():
+                    break
+                
+                # Проверяем БД
+                if not self.db.is_connected:
+                    self._logger.warning("Health: БД отключена, попытка переподключения...")
+                    self.db.connect()
+                    if self.db.is_connected:
+                        self.db.init_tables()
+                
+                # Проверяем GigaChat
+                if self.config.enable_gigachat and self.gigachat:
+                    if not self.gigachat.is_connected:
+                        self._logger.warning("Health: GigaChat отключен, попытка переподключения...")
+                        self.gigachat.authenticate()
+                
+                # Очищаем истёкшие баны
+                self.db.clean_expired_bans()
+                
+                self._logger.info(
+                    f"Health: OK | БД:{'✅' if self.db.is_connected else '❌'} | "
+                    f"VK:{'✅' if self.vk.is_connected else '❌'} | "
+                    f"GC:{'✅' if self.gigachat.is_connected else '❌'} | "
+                    f"Uptime: {self.stats.uptime_str()}"
                 )
-            except ValueError:
-                send_msg(user_id, "❌ Неверный формат. Пример: Текст | 2024-10-25 15:00")
-            return
+                
+            except Exception as e:
+                self._logger.error(f"Health check ошибка: {e}")
+    
+    def _stats_loop(self):
+        """Периодический дамп статистики в БД."""
+        while not self._shutdown_event.is_set():
+            try:
+                self._shutdown_event.wait(STATS_DUMP_INTERVAL)
+                if self._shutdown_event.is_set():
+                    break
+                
+                self.db.increment_stat('total_messages_received', self.stats.total_messages_received)
+                self.db.increment_stat('total_messages_sent', self.stats.total_messages_sent)
+                self.db.increment_stat('total_gigachat_calls', self.stats.total_gigachat_calls)
+                self.db.increment_stat('total_errors', self.stats.total_errors)
+                self.db.increment_stat('total_spam_blocked', self.stats.total_spam_blocked)
+                
+                self._logger.info(
+                    f"Stats dump: msg_in={self.stats.total_messages_received}, "
+                    f"msg_out={self.stats.total_messages_sent}, "
+                    f"gc_calls={self.stats.total_gigachat_calls}, "
+                    f"errors={self.stats.total_errors}"
+                )
+                
+            except Exception as e:
+                self._logger.error(f"Stats dump ошибка: {e}")
+    
+    # --- Управление жизненным циклом ---
+    
+    def request_shutdown(self):
+        """Запрашивает остановку бота."""
+        self._logger.info("Получен запрос на остановку...")
+        self._state = BotState.STOPPING
+        self._shutdown_event.set()
+    
+    def _wait_for_threads(self):
+        """Ждёт завершения всех потоков."""
+        self._logger.info("Ожидание завершения потоков...")
+        
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=5)
+        
+        for t in self._worker_threads:
+            if t.is_alive():
+                t.join(timeout=5)
+        
+        if self._health_thread and self._health_thread.is_alive():
+            self._health_thread.join(timeout=2)
+        
+        if self._stats_thread and self._stats_thread.is_alive():
+            self._stats_thread.join(timeout=2)
+    
+    def _cleanup(self):
+        """Очищает ресурсы при завершении."""
+        self._logger.info("Очистка ресурсов...")
+        
+        if self.db:
+            self.db.disconnect()
+        
+        # Отключаем предупреждения requests
+        import warnings
+        warnings.filterwarnings("ignore")
+        
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+        
+        self._state = BotState.STOPPED
 
-    if state == "reminder_delete" and text.isdigit():
-        rem_id = int(text)
-        if delete_reminder(user_id, rem_id):
-            send_msg(user_id, f"✅ Напоминание с ID {rem_id} удалено!", keyboard=kb_reminders_menu())
-        else:
-            send_msg(user_id, "❌ Не найдено напоминание с таким ID.", keyboard=kb_reminders_menu())
-        set_state(user_id, "reminders_menu")
-        return
 
-    if state == "reminder_toggle" and text.isdigit():
-        rem_id = int(text)
-        new_state_rem = toggle_reminder(user_id, rem_id)
-        if new_state_rem is not None:
-            status = "✅ включено" if new_state_rem else "⏸ выключено"
-            send_msg(user_id, f"Напоминание с ID {rem_id} {status}!", keyboard=kb_reminders_menu())
-        else:
-            send_msg(user_id, "❌ Не найдено напоминание с таким ID.", keyboard=kb_reminders_menu())
-        set_state(user_id, "reminders_menu")
-        return
+# =============================================================================
+# СИГНАЛЫ ОС
+# =============================================================================
 
-    # ============================================================
-    #  РАЗДЕЛ: ПРОГРЕСС
-    # ============================================================
-    if text == "📊 прогресс":
-        send_msg(user_id, format_progress(user_id), keyboard=kb_main_menu())
-        return
+_bot_instance: Optional[NavigatorBot] = None
 
-    # ============================================================
-    #  РАЗДЕЛ: УЧЁБА (ССЫЛКИ)
-    # ============================================================
-    if text == "🔗 учёба":
-        links_text = "🔗 Полезные образовательные ресурсы:\n\n"
-        for name, url in STUDY_LINKS.items():
-            links_text += f"• {name}: {url}\n"
-        links_text += "\nНажимай на кнопки — откроются сайты! 📚"
-        send_msg(user_id, links_text, keyboard=kb_study_links())
-        return
+def _signal_handler(signum, frame):
+    """Обработчик сигналов ОС для корректного завершения."""
+    global _bot_instance
+    if _bot_instance:
+        get_logger().info(f"Получен сигнал {signum}, остановка бота...")
+        _bot_instance.request_shutdown()
 
-    # ============================================================
-    #  РАЗДЕЛ: ПОДЕЛИТЬСЯ
-    # ============================================================
-    if text == "🤝 поделиться":
-        today = datetime.now().weekday() + 1
-        lessons = get_user_schedule(user_id, today)
-        clubs = get_user_clubs(user_id, today)
-        share_text = f"📅 Моё расписание на {DAYS.get(today, 'сегодня')}:\n\n"
-        share_text += format_schedule_text(lessons, clubs)
-        share_text += "\nСкопируй и отправь другу! 🤝"
-        send_msg(user_id, share_text, keyboard=kb_main_menu())
-        return
 
-    # ============================================================
-    #  Fallback — если ничего не распознано
-    # ============================================================
-    if state not in ("main", "ai_tutor", "hw_add", "reminder_add", "club_name"):
-        send_msg(user_id, "Не понял команду. Выбери в меню! 👇", keyboard=kb_main_menu())
-    elif state in ("ai_tutor",):
-        # В режиме ИИ-тьютора любой текст — это тема
-        pass  # обработано выше
-    else:
-        send_msg(user_id, "Не понял. Выбери кнопку в меню! 👇", keyboard=kb_main_menu())
+def _setup_signal_handlers(bot: NavigatorBot):
+    """Устанавливает обработчики сигналов."""
+    global _bot_instance
+    _bot_instance = bot
+    
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
-# ============================================================
-#  ЗАПУСК
-# ============================================================
+
+# =============================================================================
+# ФУНКЦИЯ БАННЕРА
+# =============================================================================
+
+def print_banner():
+    """Выводит баннер в консоль при запуске."""
+    banner = r"""
+    ╔══════════════════════════════════════════════════════════╗
+    ║                                                          ║
+    ║     ★  Н А В И Г А Т О Р   У С П Е Х А  ★               ║
+    ║                                                          ║
+    ║     VK-бот с интеграцией GigaChat                        ║
+    ║     Версия 2.0.0                                         ║
+    ║     LifeCode Studio                                      ║
+    ║                                                          ║
+    ╚══════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+
+# =============================================================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# =============================================================================
 
 def main():
-    init_db()
-    setup_scheduler()
-    # Запускаем планировщик в отдельном потоке
-    scheduler_thread = threading.Thread(target=scheduler.start, daemon=True)
-    scheduler_thread.start()
-    logging.info("Планировщик фоновых задач запущен.")
+    """Главная функция — точка входа."""
+    print_banner()
+    
+    # Загрузка конфигурации
+    config = BotConfig.from_env()
+    
+    # Инициализация логгера
+    BotLogger.setup(config.log_file, config.log_level)
+    logger = get_logger()
+    
+    logger.info("=" * 60)
+    logger.info(f"  {BOT_NAME} v{BOT_VERSION}")
+    logger.info(f"  Запуск: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 60)
+    
+    # Отключение предупреждений SSL
+    import warnings
+    warnings.filterwarnings("ignore")
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+    
+    # Проверка Python версии
+    if sys.version_info < (3, 10):
+        logger.error("Требуется Python 3.10 или выше!")
+        sys.exit(1)
+    
+    logger.info(f"Python: {sys.version.split()[0]}")
+    logger.info(f"ОС: {sys.platform}")
+    logger.info(f"Хост: {socket.gethostname()}")
+    
+    # Создание и запуск бота
+    bot = NavigatorBot(config)
+    
+    # Установка обработчиков сигналов
+    _setup_signal_handlers(bot)
+    
+    # Запуск
+    try:
+        bot.start()
+    except KeyboardInterrupt:
+        logger.info("Принудительная остановка (Ctrl+C)")
+        bot.request_shutdown()
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {e}")
+        logger.debug(traceback.format_exc())
+        sys.exit(1)
+    
+    logger.info("Программа завершена.")
 
-    vk_session = vk_api.VkApi(token=VK_TOKEN)
-    longpoll = VkLongPoll(vk_session)
-    vk = vk_session.get_api()
-    logging.info("Бот «Навигатор успеха» запущен. Ожидание сообщений...")
 
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            try:
-                handle_message(event, vk)
-            except Exception as e:
-                logging.error(f"Error handling message: {e}", exc_info=True)
-                try:
-                    send_msg(event.user_id, "Ой, что-то пошло не так 😵 Попробуй ещё раз или нажми «🏠 Меню».", keyboard=kb_main_menu())
-                except:
-                    pass
+# =============================================================================
+# ТОЧКА ВХОДА
+# =============================================================================
 
 if __name__ == "__main__":
     main()
